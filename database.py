@@ -1,0 +1,561 @@
+"""Работа с SQLite для BIBISHKA Admin Bot."""
+
+from __future__ import annotations
+
+import logging
+import re
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Iterator
+
+from config import config
+
+
+logger = logging.getLogger(__name__)
+_db_lock = threading.RLock()
+
+
+BIBISHKA_FACTS: dict[str, str] = {
+    "real_name": "Бибисора",
+    "age": "15 лет",
+    "class": "9 класс",
+    "birthday": "25 августа",
+    "country": "Узбекистан",
+    "city": "Андижан",
+    "best_friend": "Садокат",
+    "friends": "Нурик, Абубакр, Эмиль",
+}
+
+
+DEFAULT_FAQ: list[tuple[str, str]] = [
+    (
+        "Кто такая Бибишка,Бибишка,О Бибишке,Кто такая Бибисора",
+        "💖 Бибишка — это Бибисора, блогерша и главная звезда этого чата. Бот помогает быстро отвечать на вопросы, держать порядок и красиво оформлять активность.",
+    ),
+    (
+        "Сколько лет,Возраст,Сколько лет Бибисоре,Сколько лет Бибишке",
+        "🎂 Бибисоре 15 лет.",
+    ),
+    (
+        "Где живет,Где живёт,Город,Страна,Андижан,Узбекистан",
+        "📍 Бибисора живет в Узбекистане, в городе Андижан.",
+    ),
+    (
+        "В каком классе,Класс,Учеба,Учёба,Школа",
+        "📚 Бибисора учится в 9 классе.",
+    ),
+    (
+        "Когда день рождения,День рождения,Родилась,Дата рождения",
+        "🎉 День рождения Бибисоры — 25 августа.",
+    ),
+    (
+        "Лучшая подруга,Подруга,Садокат",
+        "👑 Лучшая подруга Бибисоры — Садокат.",
+    ),
+    (
+        "Друзья,Нурик,Абубакр,Эмиль",
+        "🤝 Друзья Бибисоры: Нурик, Абубакр и Эмиль.",
+    ),
+    (
+        "Соцсети,Социальные сети,Ссылки,Инстаграм,Instagram,TikTok,ТикТок,Telegram,Телеграм",
+        "🌐 Раздел соцсетей открыт в меню /start. Админы могут добавить актуальные ссылки через FAQ или настройки.",
+    ),
+    (
+        "Когда стрим,Стрим,Стримы,Расписание стримов,Эфир",
+        "🎥 Расписание стримов появится в разделе «Стримы». Следи за меню бота и закрепами в чате.",
+    ),
+    (
+        "Модератор,Модераторы,Как попасть в модераторы,Стать модератором",
+        "🛡 В модераторы попадают активные и спокойные участники, которые помогают чату, знают правила и не создают конфликтов.",
+    ),
+    (
+        "Связаться,Контакт,Как связаться,Написать Бибишке",
+        "✉️ Для связи используй официальные контакты или раздел «Реклама», если вопрос связан с рекламой.",
+    ),
+    (
+        "Реклама,Сотрудничество,Купить рекламу,Пиар",
+        "📣 По рекламе открой раздел «Реклама» в /start и отправь предложение. Оно уйдет ответственному администратору.",
+    ),
+]
+
+DEFAULT_SETTINGS: dict[str, str] = {
+    "content_version": "2",
+    "filter_bad_words": "1",
+    "filter_spam": "1",
+    "filter_links": "1",
+    "filter_caps": "1",
+    "bad_words": "бля,блять,сука,хуй,хуе,хуё,пизд,еба,ёба,ебл,мудак,мразь,шлюх,гандон,долбоеб,долбоёб,уеб,уёб",
+    "max_warnings": "3",
+    "warn_mute_seconds": "600",
+    "default_mute_seconds": "600",
+    "default_ban_seconds": "0",
+    "ads_receiver_id": "8436225978",
+    "rules_text": (
+        "📌 Правила чата:\n"
+        "1. Уважай Бибишку, админов и участников.\n"
+        "2. Без мата, травли, спама, капса и токсичности.\n"
+        "3. Не кидай подозрительные ссылки и рекламу без разрешения.\n"
+        "4. Личные данные, конфликты и провокации — мимо чата.\n"
+        "5. Наказания выдаются по правилам: предупреждения, мут, бан."
+    ),
+    "streams_text": "🎥 Расписание стримов пока уточняется. Следи за новостями в чате и официальных соцсетях Бибишки.",
+    "socials_text": "🌐 Соцсети Бибишки можно указать через FAQ: TikTok, Instagram и Telegram.",
+    "ads_text": "📣 Чтобы предложить рекламу, нажми «Реклама» и отправь одним сообщением: тему, ссылку, сроки и бюджет.",
+    "ai_enabled": "1",
+}
+
+
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """Открывает соединение с SQLite и безопасно закрывает его после операций."""
+    db_path = Path(config.database_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        logger.exception("Ошибка при работе с базой данных")
+        raise
+    finally:
+        connection.close()
+
+
+def _ensure_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Добавляет настройку, если ее еще нет."""
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+        (key, value),
+    )
+
+
+def _remove_removed_faq(conn: sqlite3.Connection) -> None:
+    """Удаляет FAQ-записи, которые пользователь попросил убрать."""
+    removed_tokens = ["донат", "donate", "ютуб", "ютьюб", "youtube"]
+    for token in removed_tokens:
+        conn.execute(
+            "DELETE FROM faq WHERE LOWER(keywords) LIKE ? OR LOWER(answer) LIKE ?",
+            (f"%{token}%", f"%{token}%"),
+        )
+
+
+def _ensure_default_faq(conn: sqlite3.Connection) -> None:
+    """Создает стартовые FAQ и добавляет новые обязательные записи без дублей."""
+    faq_count = conn.execute("SELECT COUNT(*) FROM faq").fetchone()[0]
+    if faq_count == 0:
+        conn.executemany("INSERT INTO faq (keywords, answer) VALUES (?, ?)", DEFAULT_FAQ)
+        return
+
+    for keywords, answer in DEFAULT_FAQ:
+        first_keyword = keywords.split(",", 1)[0]
+        exists = conn.execute(
+            "SELECT id FROM faq WHERE LOWER(keywords) LIKE ? LIMIT 1",
+            (f"%{first_keyword.lower()}%",),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO faq (keywords, answer) VALUES (?, ?)",
+                (keywords, answer),
+            )
+
+
+def _sync_default_faq(conn: sqlite3.Connection) -> None:
+    """Обновляет базовые FAQ при смене версии контента."""
+    for keywords, answer in DEFAULT_FAQ:
+        first_keyword = keywords.split(",", 1)[0]
+        row = conn.execute(
+            "SELECT id FROM faq WHERE LOWER(keywords) LIKE ? LIMIT 1",
+            (f"%{first_keyword.lower()}%",),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE faq SET keywords = ?, answer = ? WHERE id = ?",
+                (keywords, answer, row["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO faq (keywords, answer) VALUES (?, ?)",
+                (keywords, answer),
+            )
+
+
+def init_db(admin_ids: list[int] | None = None) -> None:
+    """Создает таблицы, настройки, FAQ и первых администраторов при запуске."""
+    admin_ids = admin_ids or []
+    with _db_lock, _connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                joined_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS faq (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keywords TEXT NOT NULL,
+                answer TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                questions_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS faq_usage (
+                faq_id INTEGER PRIMARY KEY,
+                hits INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS warnings (
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS awards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                issuer_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+        content_row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'content_version'"
+        ).fetchone()
+        needs_content_migration = content_row is None or str(content_row["value"]) != DEFAULT_SETTINGS["content_version"]
+
+        for key, value in DEFAULT_SETTINGS.items():
+            _ensure_setting(conn, key, value)
+
+        for admin_id in admin_ids:
+            conn.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (admin_id,))
+
+        _remove_removed_faq(conn)
+        if needs_content_migration:
+            _sync_default_faq(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('content_version', ?)",
+                (DEFAULT_SETTINGS["content_version"],),
+            )
+        else:
+            _ensure_default_faq(conn)
+
+
+def add_user(user_id: int, username: str | None, first_name: str | None) -> None:
+    """Добавляет пользователя или обновляет его публичные данные."""
+    joined_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
+            (user_id, username, first_name, joined_at),
+        )
+        conn.execute(
+            "UPDATE users SET username = ?, first_name = ? WHERE id = ?",
+            (username, first_name, user_id),
+        )
+
+
+def list_faq() -> list[dict[str, Any]]:
+    """Возвращает все FAQ-записи."""
+    with _db_lock, _connect() as conn:
+        rows = conn.execute("SELECT id, keywords, answer FROM faq ORDER BY id").fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_faq(faq_id: int) -> dict[str, Any] | None:
+    """Возвращает одну FAQ-запись по ID."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id, keywords, answer FROM faq WHERE id = ?",
+            (faq_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def add_faq(keywords: str, answer: str) -> int:
+    """Добавляет FAQ-запись и возвращает ее ID."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO faq (keywords, answer) VALUES (?, ?)",
+            (keywords.strip(), answer.strip()),
+        )
+        faq_id = int(cursor.lastrowid)
+    return faq_id
+
+
+def update_faq_answer(faq_id: int, answer: str) -> bool:
+    """Обновляет ответ FAQ-записи."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE faq SET answer = ? WHERE id = ?",
+            (answer.strip(), faq_id),
+        )
+    return cursor.rowcount > 0
+
+
+def delete_faq(faq_id: int) -> bool:
+    """Удаляет FAQ-запись и связанную статистику."""
+    with _db_lock, _connect() as conn:
+        conn.execute("DELETE FROM faq_usage WHERE faq_id = ?", (faq_id,))
+        cursor = conn.execute("DELETE FROM faq WHERE id = ?", (faq_id,))
+    return cursor.rowcount > 0
+
+
+def normalize_text(text: str) -> str:
+    """Нормализует текст для поиска и фильтров."""
+    return re.sub(r"\s+", " ", text.lower().replace("ё", "е")).strip()
+
+
+def split_keywords(raw_keywords: str) -> list[str]:
+    """Разделяет строку ключей на отдельные фразы."""
+    parts = re.split(r"[,;\n]+", raw_keywords)
+    return [normalize_text(part) for part in parts if part.strip()]
+
+
+def find_faq_by_text(text: str) -> dict[str, Any] | None:
+    """Ищет FAQ по ключевым словам в тексте сообщения."""
+    normalized = normalize_text(text)
+    for item in list_faq():
+        for keyword in split_keywords(item["keywords"]):
+            if keyword and keyword in normalized:
+                return item
+    return None
+
+
+def record_answer(faq_id: int | None = None) -> None:
+    """Увеличивает дневную статистику ответов и популярность FAQ."""
+    today = date.today().isoformat()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO stats (date, questions_count) VALUES (?, 0)",
+            (today,),
+        )
+        conn.execute(
+            "UPDATE stats SET questions_count = questions_count + 1 WHERE date = ?",
+            (today,),
+        )
+        if faq_id is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO faq_usage (faq_id, hits, last_used_at) VALUES (?, 0, ?)",
+                (faq_id, now),
+            )
+            conn.execute(
+                "UPDATE faq_usage SET hits = hits + 1, last_used_at = ? WHERE faq_id = ?",
+                (now, faq_id),
+            )
+
+
+def get_statistics(limit: int = 5) -> dict[str, Any]:
+    """Собирает статистику для админ-панели."""
+    today = date.today().isoformat()
+    with _db_lock, _connect() as conn:
+        users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        faq_count = conn.execute("SELECT COUNT(*) FROM faq").fetchone()[0]
+        awards_count = conn.execute("SELECT COUNT(*) FROM awards").fetchone()[0]
+        today_row = conn.execute(
+            "SELECT questions_count FROM stats WHERE date = ?",
+            (today,),
+        ).fetchone()
+        popular_rows = conn.execute(
+            """
+            SELECT faq.id, faq.keywords, COALESCE(faq_usage.hits, 0) AS hits
+            FROM faq
+            LEFT JOIN faq_usage ON faq_usage.faq_id = faq.id
+            ORDER BY hits DESC, faq.id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return {
+        "users_count": users_count,
+        "faq_count": faq_count,
+        "awards_count": awards_count,
+        "today_answers": today_row["questions_count"] if today_row else 0,
+        "popular": [dict(row) for row in popular_rows],
+    }
+
+
+def is_admin(user_id: int | None) -> bool:
+    """Проверяет, есть ли Telegram ID в списке админов бота."""
+    if user_id is None:
+        return False
+
+    with _db_lock, _connect() as conn:
+        row = conn.execute("SELECT id FROM admins WHERE id = ?", (user_id,)).fetchone()
+    return row is not None
+
+
+def add_admin(admin_id: int) -> None:
+    """Добавляет администратора бота."""
+    with _db_lock, _connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (admin_id,))
+
+
+def remove_admin(admin_id: int) -> bool:
+    """Удаляет администратора бота."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute("DELETE FROM admins WHERE id = ?", (admin_id,))
+    return cursor.rowcount > 0
+
+
+def list_admins() -> list[int]:
+    """Возвращает список администраторов бота."""
+    with _db_lock, _connect() as conn:
+        rows = conn.execute("SELECT id FROM admins ORDER BY id").fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """Возвращает настройку по ключу."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return str(row["value"]) if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    """Создает или обновляет настройку."""
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+
+def get_bool_setting(key: str, default: bool = False) -> bool:
+    """Читает булеву настройку из строки."""
+    value = get_setting(key, "1" if default else "0").strip().lower()
+    return value in {"1", "true", "yes", "on", "да", "вкл"}
+
+
+def get_int_setting(key: str, default: int) -> int:
+    """Читает числовую настройку с безопасным fallback."""
+    try:
+        return int(get_setting(key, str(default)))
+    except ValueError:
+        return default
+
+
+def list_settings() -> dict[str, str]:
+    """Возвращает все настройки одним словарем."""
+    with _db_lock, _connect() as conn:
+        rows = conn.execute("SELECT key, value FROM settings ORDER BY key").fetchall()
+    return {str(row["key"]): str(row["value"]) for row in rows}
+
+
+def warn_user(user_id: int, chat_id: int) -> int:
+    """Добавляет предупреждение пользователю и возвращает новое количество."""
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO warnings (user_id, chat_id, count, updated_at) VALUES (?, ?, 0, ?)",
+            (user_id, chat_id, now),
+        )
+        conn.execute(
+            "UPDATE warnings SET count = count + 1, updated_at = ? WHERE user_id = ? AND chat_id = ?",
+            (now, user_id, chat_id),
+        )
+        row = conn.execute(
+            "SELECT count FROM warnings WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def unwarn_user(user_id: int, chat_id: int) -> int:
+    """Снимает одно предупреждение и возвращает остаток."""
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            """
+            UPDATE warnings
+            SET count = CASE WHEN count > 0 THEN count - 1 ELSE 0 END,
+                updated_at = ?
+            WHERE user_id = ? AND chat_id = ?
+            """,
+            (now, user_id, chat_id),
+        )
+        row = conn.execute(
+            "SELECT count FROM warnings WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def clear_warnings(user_id: int, chat_id: int) -> None:
+    """Сбрасывает предупреждения после автоматического наказания."""
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "UPDATE warnings SET count = 0, updated_at = ? WHERE user_id = ? AND chat_id = ?",
+            (now, user_id, chat_id),
+        )
+
+
+def get_warnings(user_id: int, chat_id: int) -> int:
+    """Возвращает количество предупреждений пользователя в чате."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT count FROM warnings WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def add_award(user_id: int, chat_id: int, title: str, issuer_id: int) -> int:
+    """Выдает награду пользователю и возвращает ID награды."""
+    created_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO awards (user_id, chat_id, title, issuer_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, chat_id, title.strip(), issuer_id, created_at),
+        )
+        award_id = int(cursor.lastrowid)
+    return award_id
+
+
+def list_awards(user_id: int, chat_id: int | None = None) -> list[dict[str, Any]]:
+    """Возвращает награды пользователя, при необходимости только для одного чата."""
+    query = "SELECT id, user_id, chat_id, title, issuer_id, created_at FROM awards WHERE user_id = ?"
+    params: list[Any] = [user_id]
+    if chat_id is not None:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " ORDER BY id DESC"
+
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_award(award_id: int) -> bool:
+    """Удаляет награду по ID."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute("DELETE FROM awards WHERE id = ?", (award_id,))
+    return cursor.rowcount > 0
