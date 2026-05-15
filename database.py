@@ -244,6 +244,13 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 issuer_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
+            
+            CREATE TABLE IF NOT EXISTS game_participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL UNIQUE,
+                username TEXT,
+                joined_at TEXT NOT NULL
+            );
             """
         )
 
@@ -630,3 +637,38 @@ def delete_award(award_id: int) -> bool:
     with _db_lock, _connect() as conn:
         cursor = conn.execute("DELETE FROM awards WHERE id = ?", (award_id,))
     return cursor.rowcount > 0
+
+
+def add_game_participant(user_id: int, username: str | None) -> bool:
+    """Добавляет пользователя в список участников игры. Возвращает True, если добавлен."""
+    joined_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO game_participants (user_id, username, joined_at) VALUES (?, ?, ?)",
+                (user_id, username, joined_at),
+            )
+            return True
+        except Exception:
+            # Уже есть или другая ошибка — считаем, что участник не добавлен
+            return False
+
+
+def is_game_participant(user_id: int) -> bool:
+    """Проверяет, участвует ли пользователь в игре."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM game_participants WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
+def list_game_participants(limit: int = 100) -> list[dict[str, Any]]:
+    """Возвращает список участников игры."""
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, username, joined_at FROM game_participants ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]

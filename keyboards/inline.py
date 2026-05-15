@@ -18,6 +18,8 @@ def _faq_label(item: dict[str, Any]) -> str:
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     """Создает главное меню для /start."""
     builder = InlineKeyboardBuilder()
+    # Быстрая кнопка для присоединения к игре
+    builder.button(text="🎮 Игра", callback_data="game:join")
     builder.button(text="❓ FAQ", callback_data="main:faq")
     builder.button(text="🌐 Соцсети", callback_data="main:socials")
     builder.button(text="🎥 Стримы", callback_data="main:streams")
@@ -26,6 +28,14 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🏆 Награды", callback_data="main:awards")
     builder.adjust(2, 2, 2)
     return builder.as_markup()
+
+
+def private_start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопкой для открытия личных сообщений с ботом."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    url = f"https://t.me/{bot_username}?start=join"
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Написать в ЛС", url=url)]])
 
 
 def faq_public_keyboard(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:

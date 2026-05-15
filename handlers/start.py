@@ -17,8 +17,10 @@ from keyboards.inline import (
     back_to_main_keyboard,
     faq_public_keyboard,
     main_menu_keyboard,
+    private_start_keyboard,
     socials_keyboard,
 )
+from keyboards.reply import user_reply_keyboard
 from states.admin_states import AdRequest
 from utils.users import mention_by_id
 
@@ -93,6 +95,9 @@ async def cmd_start(message: Message) -> None:
         "Напиши <b>Бибишка, твой вопрос</b>, и я отвечу как локальный бесплатный AI-помощник."
     )
     await message.answer(text, reply_markup=main_menu_keyboard())
+    # В личных сообщениях показываем компактную reply-клавиатуру с быстрыми командами
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Быстрые команды:", reply_markup=user_reply_keyboard())
 
 
 @router.message(Command("help"))
@@ -191,6 +196,47 @@ async def callback_main_staff(callback: CallbackQuery, bot: Bot) -> None:
     )
     text = await _format_staff(bot, chat_id)
     await _safe_edit(callback, text, reply_markup=back_to_main_keyboard())
+
+
+@router.callback_query(F.data == "game:join")
+async def callback_game_join(callback: CallbackQuery, bot: Bot) -> None:
+    """При нажатии на кнопку игры в группе — предлагаем написать боту в ЛС."""
+    await callback.answer()
+    me = await bot.get_me()
+    username = getattr(me, "username", None)
+    if username:
+        await callback.message.answer(
+            "Чтобы присоединиться к игре, напишите боту в личные сообщения:",
+            reply_markup=private_start_keyboard(username),
+        )
+    else:
+        await callback.message.answer("Чтобы присоединиться к игре, напишите боту в личку.")
+
+
+@router.message(Command("join"))
+async def cmd_join(message: Message, bot: Bot) -> None:
+    """Команда /join — если в группе, просим открыть ЛС, если в личке — регистрируем участника."""
+    if message.chat.type != ChatType.PRIVATE:
+        me = await bot.get_me()
+        username = getattr(me, "username", None)
+        if username:
+            await message.answer(
+                "Для участия нажмите кнопку и напишите боту в личку:",
+                reply_markup=private_start_keyboard(username),
+            )
+        else:
+            await message.answer("Для участия напишите боту в личные сообщения.")
+        return
+
+    if message.from_user is None:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    added = db.add_game_participant(message.from_user.id, message.from_user.username)
+    if added:
+        await message.answer("✅ Вы успешно присоединились к игре! Удачи!", reply_markup=back_to_main_keyboard())
+    else:
+        await message.answer("ℹ️ Вы уже участвуете в игре.", reply_markup=back_to_main_keyboard())
 
 
 @router.callback_query(F.data == "main:awards")
