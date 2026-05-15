@@ -18,6 +18,7 @@ from keyboards.inline import (
     admin_menu_keyboard,
     admins_manage_keyboard,
     admins_remove_keyboard,
+    admins_select_keyboard,
     delete_confirm_keyboard,
     faq_admin_list_keyboard,
     settings_keyboard,
@@ -322,10 +323,25 @@ async def callback_admin_stats(callback: CallbackQuery) -> None:
 async def callback_admins(callback: CallbackQuery, bot: Bot) -> None:
     """Показывает управление администраторами."""
     await callback.answer()
-    admin_ids = db.list_admins()
-    admin_lines = [f"• {await mention_by_id(bot, admin_id)}" for admin_id in admin_ids]
-    ids_text = "\n".join(admin_lines) or "Пока нет администраторов."
-    await _safe_edit(callback, f"👥 <b>Администраторы</b>\n\n{ids_text}", reply_markup=admins_manage_keyboard())
+    admins = db.list_admins(include_hidden=True)
+    if not admins:
+        await _safe_edit(callback, "Пока нет администраторов.", reply_markup=admin_back_keyboard())
+        return
+
+    lines = ["👥 <b>Администраторы</b>\n"]
+    for admin in admins:
+        admin_id = admin["id"]
+        rank = admin.get("rank", "Админ")
+        title = admin.get("title", "")
+        is_hidden = admin.get("is_hidden", 0)
+        mention = await mention_by_id(bot, admin_id)
+        hidden_mark = " 🔒" if is_hidden else ""
+        if title:
+            lines.append(f"• {mention} — <b>{rank}</b> ({title}){hidden_mark}")
+        else:
+            lines.append(f"• {mention} — <b>{rank}</b>{hidden_mark}")
+
+    await _safe_edit(callback, "\n".join(lines), reply_markup=admins_manage_keyboard())
 
 
 @router.callback_query(AdminFilter(), F.data == "admin:add_admin")
@@ -354,12 +370,12 @@ async def state_add_admin(message: Message, state: FSMContext, bot: Bot) -> None
 async def callback_remove_admin(callback: CallbackQuery) -> None:
     """Показывает админов для удаления."""
     await callback.answer()
-    admin_ids = db.list_admins()
-    if not admin_ids:
+    admins = db.list_admins(include_hidden=True)
+    if not admins:
         await _safe_edit(callback, "Список администраторов пуст.", reply_markup=admin_back_keyboard())
         return
 
-    await _safe_edit(callback, "Выберите администратора для удаления:", reply_markup=admins_remove_keyboard(admin_ids))
+    await _safe_edit(callback, "Выберите администратора для удаления:", reply_markup=admins_select_keyboard(admins, "remove_admin"))
 
 
 @router.callback_query(AdminFilter(), F.data.startswith("admin:remove_admin:"))
@@ -377,6 +393,123 @@ async def callback_remove_admin_pick(callback: CallbackQuery, bot: Bot) -> None:
         await _safe_edit(callback, f"✅ Администратор {admin_label} удален.", reply_markup=admin_back_keyboard())
     else:
         await _safe_edit(callback, "Администратор не найден.", reply_markup=admin_back_keyboard())
+
+
+@router.callback_query(AdminFilter(), F.data == "admin:set_rank")
+async def callback_set_rank(callback: CallbackQuery) -> None:
+    """Показывает админов для установки ранга."""
+    await callback.answer()
+    admins = db.list_admins(include_hidden=True)
+    if not admins:
+        await _safe_edit(callback, "Список администраторов пуст.", reply_markup=admin_back_keyboard())
+        return
+
+    await _safe_edit(callback, "Выберите администратора для установки ранга:", reply_markup=admins_select_keyboard(admins, "set_rank"))
+
+
+@router.callback_query(AdminFilter(), F.data.startswith("admin:set_rank:"))
+async def callback_set_rank_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запрашивает новый ранг для администратора."""
+    await callback.answer()
+    try:
+        admin_id = int(callback.data.rsplit(":", 1)[1]) if callback.data else 0
+    except ValueError:
+        await _safe_edit(callback, "Некорректный ID.", reply_markup=admin_back_keyboard())
+        return
+
+    await state.update_data(admin_id=admin_id)
+    await state.set_state(AdminManage.set_rank)
+    await _safe_edit(callback, "🏅 Отправьте новый ранг для администратора.", reply_markup=admin_cancel_keyboard())
+
+
+@router.message(AdminManage.set_rank, AdminFilter())
+async def state_set_rank(message: Message, state: FSMContext) -> None:
+    """Устанавливает ранг администратора."""
+    if not message.text or not message.text.strip():
+        await message.answer("Ранг не должен быть пустым.", reply_markup=admin_cancel_keyboard())
+        return
+
+    data = await state.get_data()
+    admin_id = int(data["admin_id"])
+    db.set_admin_rank(admin_id, message.text.strip())
+    await state.clear()
+    await message.answer(f"✅ Ранг администратора обновлен на: {message.text.strip()}", reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(AdminFilter(), F.data == "admin:set_title")
+async def callback_set_title(callback: CallbackQuery) -> None:
+    """Показывает админов для установки должности."""
+    await callback.answer()
+    admins = db.list_admins(include_hidden=True)
+    if not admins:
+        await _safe_edit(callback, "Список администраторов пуст.", reply_markup=admin_back_keyboard())
+        return
+
+    await _safe_edit(callback, "Выберите администратора для установки должности:", reply_markup=admins_select_keyboard(admins, "set_title"))
+
+
+@router.callback_query(AdminFilter(), F.data.startswith("admin:set_title:"))
+async def callback_set_title_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запрашивает новую должность для администратора."""
+    await callback.answer()
+    try:
+        admin_id = int(callback.data.rsplit(":", 1)[1]) if callback.data else 0
+    except ValueError:
+        await _safe_edit(callback, "Некорректный ID.", reply_markup=admin_back_keyboard())
+        return
+
+    await state.update_data(admin_id=admin_id)
+    await state.set_state(AdminManage.set_title)
+    await _safe_edit(callback, "📝 Отправьте новую должность для администратора (или оставьте пустым для очистки).", reply_markup=admin_cancel_keyboard())
+
+
+@router.message(AdminManage.set_title, AdminFilter())
+async def state_set_title(message: Message, state: FSMContext) -> None:
+    """Устанавливает должность администратора."""
+    title = message.text.strip() if message.text else ""
+    data = await state.get_data()
+    admin_id = int(data["admin_id"])
+    db.set_admin_title(admin_id, title)
+    await state.clear()
+    if title:
+        await message.answer(f"✅ Должность администратора обновлена на: {title}", reply_markup=admin_menu_keyboard())
+    else:
+        await message.answer("✅ Должность администратора очищена.", reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(AdminFilter(), F.data == "admin:toggle_hidden")
+async def callback_toggle_hidden(callback: CallbackQuery) -> None:
+    """Показывает админов для скрытия/показа."""
+    await callback.answer()
+    admins = db.list_admins(include_hidden=True)
+    if not admins:
+        await _safe_edit(callback, "Список администраторов пуст.", reply_markup=admin_back_keyboard())
+        return
+
+    await _safe_edit(callback, "Выберите администратора для скрытия/показа:", reply_markup=admins_select_keyboard(admins, "toggle_hidden"))
+
+
+@router.callback_query(AdminFilter(), F.data.startswith("admin:toggle_hidden:"))
+async def callback_toggle_hidden_pick(callback: CallbackQuery, bot: Bot) -> None:
+    """Переключает видимость администратора."""
+    await callback.answer()
+    try:
+        admin_id = int(callback.data.rsplit(":", 1)[1]) if callback.data else 0
+    except ValueError:
+        await _safe_edit(callback, "Некорректный ID.", reply_markup=admin_back_keyboard())
+        return
+
+    admin_info = db.get_admin_info(admin_id)
+    if not admin_info:
+        await _safe_edit(callback, "Администратор не найден.", reply_markup=admin_back_keyboard())
+        return
+
+    current_hidden = admin_info.get("is_hidden", 0)
+    new_hidden = not bool(current_hidden)
+    db.set_admin_hidden(admin_id, new_hidden)
+    admin_label = await mention_by_id(bot, admin_id, "администратор")
+    status = "скрыт" if new_hidden else "показан"
+    await _safe_edit(callback, f"✅ Администратор {admin_label} теперь {status}.", reply_markup=admin_back_keyboard())
 
 
 @router.callback_query(AdminFilter(), F.data == "admin:settings")

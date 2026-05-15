@@ -108,6 +108,9 @@ def admins_manage_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Добавить администратора", callback_data="admin:add_admin")
     builder.button(text="🗑 Удалить администратора", callback_data="admin:remove_admin")
+    builder.button(text="🏅 Установить ранг", callback_data="admin:set_rank")
+    builder.button(text="📝 Установить должность", callback_data="admin:set_title")
+    builder.button(text="👁 Скрыть/показать админа", callback_data="admin:toggle_hidden")
     builder.button(text="⬅️ В админ-панель", callback_data="admin:menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -118,6 +121,25 @@ def admins_remove_keyboard(admin_ids: list[int]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for index, admin_id in enumerate(admin_ids, start=1):
         builder.button(text=f"🗑 Администратор {index}", callback_data=f"admin:remove_admin:{admin_id}")
+    builder.button(text="⬅️ Назад", callback_data="admin:admins")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admins_select_keyboard(admins: list[dict[str, Any]], action: str) -> InlineKeyboardMarkup:
+    """Создает список администраторов для выбора действия."""
+    builder = InlineKeyboardBuilder()
+    for admin in admins:
+        admin_id = admin["id"]
+        rank = admin.get("rank", "Админ")
+        title = admin.get("title", "")
+        is_hidden = admin.get("is_hidden", 0)
+        hidden_mark = " 🔒" if is_hidden else ""
+        label = f"{rank}"
+        if title:
+            label += f" ({title})"
+        label += hidden_mark
+        builder.button(text=label, callback_data=f"admin:{action}:{admin_id}")
     builder.button(text="⬅️ Назад", callback_data="admin:admins")
     builder.adjust(1)
     return builder.as_markup()

@@ -33,11 +33,13 @@ class BotConfig:
     token: str
     database_path: Path
     admin_ids: list[int]
+    openai_api_key: str
 
 
 config = BotConfig(
     token=os.getenv("BOT_TOKEN", "").strip(),
     database_path=Path(os.getenv("DATABASE_PATH", BASE_DIR / "data" / "bot.db")),
     admin_ids=_parse_admin_ids(os.getenv("ADMIN_IDS")),
+    openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
 )
 

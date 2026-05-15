@@ -19,9 +19,12 @@ class FAQEdit(StatesGroup):
 
 
 class AdminManage(StatesGroup):
-    """Состояние добавления администратора."""
+    """Состояния управления администраторами."""
 
     add_admin_id = State()
+    set_rank = State()
+    set_title = State()
+    toggle_hidden = State()
 
 
 class SettingsManage(StatesGroup):

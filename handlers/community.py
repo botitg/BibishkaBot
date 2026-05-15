@@ -44,11 +44,18 @@ async def cmd_staff(message: Message, bot: Bot) -> None:
     """Показывает состав админов бота и текущего чата."""
     lines = ["👑 <b>Админский состав</b>\n"]
 
-    bot_admins = db.list_admins()
+    bot_admins = db.list_admins(include_hidden=False)
     if bot_admins:
         lines.append("<b>Админы бота:</b>")
-        for admin_id in bot_admins:
-            lines.append(f"• {await mention_by_id(bot, admin_id)}")
+        for admin in bot_admins:
+            admin_id = admin["id"]
+            rank = admin.get("rank", "Админ")
+            title = admin.get("title", "")
+            mention = await mention_by_id(bot, admin_id)
+            if title:
+                lines.append(f"• {mention} — <b>{rank}</b> ({title})")
+            else:
+                lines.append(f"• {mention} — <b>{rank}</b>")
     else:
         lines.append("Админы бота пока не назначены.")
 
