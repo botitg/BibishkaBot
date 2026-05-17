@@ -387,6 +387,13 @@ def add_user(user_id: int, username: str | None, first_name: str | None) -> None
         )
 
 
+def user_exists(user_id: int) -> bool:
+    """Проверяет, есть ли пользователь в таблице users (т.е. писал ли боту в ЛС)."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row is not None
+
+
 def list_faq() -> list[dict[str, Any]]:
     """Возвращает все FAQ-записи."""
     with _db_lock, _connect() as conn:

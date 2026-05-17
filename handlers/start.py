@@ -275,16 +275,47 @@ async def callback_main_staff(callback: CallbackQuery, bot: Bot) -> None:
 async def callback_game_join(callback: CallbackQuery, bot: Bot) -> None:
     """При нажатии на кнопку игры в группе — предлагаем написать боту в ЛС."""
     await callback.answer()
+    # Универсальная обработка нажатия: поддерживает callback вида "game:join:CHAT_ID"
+    data = callback.data or ""
+    parts = data.split(":")
+    chat_id = None
+    if len(parts) >= 3 and parts[2].isdigit():
+        chat_id = int(parts[2])
+    elif callback.message and callback.message.chat and callback.message.chat.type != ChatType.PRIVATE:
+        chat_id = callback.message.chat.id
+
+    user = callback.from_user
+    if user is None or chat_id is None:
+        await callback.answer("Невозможно зарегистрировать: нет контекста чата.", show_alert=True)
+        return
+
+    # Если пользователь уже писал боту в ЛС — регистрируем мгновенно
+    if db.user_exists(user.id):
+        added = db.add_game_participant(user.id, user.username, chat_id)
+        mention = None
+        try:
+            chat = await bot.get_chat(user.id)
+            name = escape(getattr(chat, "full_name", str(user.full_name or user.username or "пользователь")))
+            mention = f'<a href="tg://user?id={user.id}">{name}</a>'
+        except Exception:
+            mention = f'<a href="tg://user?id={user.id}">{escape(user.full_name or user.username or "пользователь")}</a>'
+
+        if added:
+            await callback.answer("✅ Вы присоединились к игре.")
+            await bot.send_message(chat_id, f"✅ {mention} присоединился к игре.", parse_mode="HTML")
+        else:
+            await callback.answer("ℹ️ Вы уже участвуете в этой игре.")
+        return
+
+    # Иначе — пользователь ещё не писал боту. Подсказка: откройте ЛС и нажмите Start
     me = await bot.get_me()
     username = getattr(me, "username", None)
-    if username:
-        chat_id = callback.message.chat.id if callback.message and callback.message.chat else None
-        await callback.message.answer(
-            "Чтобы присоединиться к игре, напишите боту в личные сообщения:",
-            reply_markup=private_start_keyboard(username, chat_id),
-        )
-    else:
-        await callback.message.answer("Чтобы присоединиться к игре, напишите боту в личку.")
+    start_url = f"https://t.me/{username}?start=join_{chat_id}" if username else None
+    alert_text = "Откройте личные сообщения бота и нажмите 'Start', затем снова нажмите кнопку 'Присоединиться' в чате."
+    if start_url:
+        alert_text += f"\nСсылка: {start_url}"
+
+    await callback.answer(alert_text, show_alert=True)
 
 
 @router.message(Command("join"))
@@ -406,7 +437,7 @@ async def cmd_startgame(message: Message, bot: Bot) -> None:
                 "⚠️ Некоторым игрокам не удалось отправить роль в ЛС — они удалены из игры. Убедитесь, что все участники нажали 'Присоединиться' и открыли бота.",
             )
 
-        await message.answer(f"🎮 Игра началась в чате — roles отправлены в ЛС. Участников: {player_count - len(removed)}")
+        await message.answer(f"🎮 Игра началась в чате — роли отправлены в ЛС. Участников: {player_count - len(removed)}")
         return
 
     # Иначе — просто показываем приглашение присоединиться
@@ -415,11 +446,11 @@ async def cmd_startgame(message: Message, bot: Bot) -> None:
     url = f"https://t.me/{username}?start=join_{message.chat.id}" if username else None
 
     builder = InlineKeyboardBuilder()
+    # Быстрая регистрация (если пользователь уже писал боту в ЛС)
+    builder.button(text="➕ Присоединиться", callback_data=f"game:join:{message.chat.id}")
+    # Кнопка для открытия ЛС (если нужно написать боту и нажать Start)
     if url:
-        builder.button(text="🔗 Присоединиться", url=url)
-    else:
-        # fallback: show instruction to write in PM
-        builder.button(text="🔗 Присоединиться (написать в ЛС)", callback_data="game:join")
+        builder.button(text="✉️ Написать в ЛС", url=url)
     builder.button(text="👥 Участники", callback_data=f"game:participants:{message.chat.id}")
     builder.adjust(2)
 
@@ -598,6 +629,9 @@ async def private_lastword_capture(message: Message, bot: Bot) -> None:
     if message.from_user is None:
         return
 
+    # Сохраняем факт, что пользователь писал боту в ЛС
+    db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+
     user_id = message.from_user.id
     # Игнорируем команды — они обрабатываются отдельно
     if message.text and message.text.startswith("/"):
@@ -623,6 +657,10 @@ async def private_message_prompt(message: Message) -> None:
     # Игнорируем команды — они обрабатываются отдельно
     if message.text and message.text.startswith("/"):
         return
+
+    # Сохраняем факт, что пользователь писал боту в ЛС
+    if message.from_user:
+        db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
 
     if message.from_user and not db.is_game_participant_global(message.from_user.id):
         await message.answer(
