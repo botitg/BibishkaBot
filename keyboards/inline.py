@@ -42,7 +42,8 @@ def private_start_keyboard(bot_username: str, chat_id: int | None = None) -> Inl
         url = f"https://t.me/{bot_username}?start=join_{chat_id}"
     else:
         url = f"https://t.me/{bot_username}?start=join"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Написать в ЛС", url=url)]])
+    # Текст кнопки изменён: избегаем формулировки 'Написать'
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть бота", url=url)]])
 
 
 def faq_public_keyboard(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:

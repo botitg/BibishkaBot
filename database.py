@@ -274,8 +274,11 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 chat_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 issuer_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
+                created_at TEXT NOT NULL,
+                emoji TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                rarity TEXT DEFAULT 'common'
+                );
             
             CREATE TABLE IF NOT EXISTS game_participants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,6 +318,22 @@ def init_db(admin_ids: list[int] | None = None) -> None:
             )
         except Exception:
             pass  # Колонки уже существуют
+
+        # Попытка добавить новые поля в таблицу awards для более красивых наград
+        try:
+            conn.execute("ALTER TABLE awards ADD COLUMN emoji TEXT DEFAULT ''")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE awards ADD COLUMN description TEXT DEFAULT ''")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE awards ADD COLUMN rarity TEXT DEFAULT 'common'")
+        except Exception:
+            pass
 
         content_row = conn.execute(
             "SELECT value FROM settings WHERE key = 'content_version'"
@@ -678,13 +697,27 @@ def get_warnings(user_id: int, chat_id: int) -> int:
     return int(row["count"]) if row else 0
 
 
-def add_award(user_id: int, chat_id: int, title: str, issuer_id: int) -> int:
-    """Выдает награду пользователю и возвращает ID награды."""
+def add_award(
+    user_id: int,
+    chat_id: int,
+    title: str,
+    issuer_id: int,
+    emoji: str | None = None,
+    description: str | None = None,
+    rarity: str | None = None,
+) -> int:
+    """Выдает награду пользователю и возвращает ID награды.
+
+    Поддерживает опциональные поля `emoji`, `description`, `rarity`.
+    """
     created_at = datetime.utcnow().isoformat(timespec="seconds")
+    emoji = emoji or ""
+    description = description or ""
+    rarity = rarity or "common"
     with _db_lock, _connect() as conn:
         cursor = conn.execute(
-            "INSERT INTO awards (user_id, chat_id, title, issuer_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (user_id, chat_id, title.strip(), issuer_id, created_at),
+            "INSERT INTO awards (user_id, chat_id, title, issuer_id, created_at, emoji, description, rarity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, chat_id, title.strip(), issuer_id, created_at, emoji, description, rarity),
         )
         award_id = int(cursor.lastrowid)
     return award_id
@@ -692,7 +725,7 @@ def add_award(user_id: int, chat_id: int, title: str, issuer_id: int) -> int:
 
 def list_awards(user_id: int, chat_id: int | None = None) -> list[dict[str, Any]]:
     """Возвращает награды пользователя, при необходимости только для одного чата."""
-    query = "SELECT id, user_id, chat_id, title, issuer_id, created_at FROM awards WHERE user_id = ?"
+    query = "SELECT id, user_id, chat_id, title, issuer_id, created_at, emoji, description, rarity FROM awards WHERE user_id = ?"
     params: list[Any] = [user_id]
     if chat_id is not None:
         query += " AND chat_id = ?"
@@ -820,6 +853,20 @@ def get_game_players(game_id: int) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def clear_game_participants_by_chat(chat_id: int) -> int:
+    """Удаляет всех участников лобби для указанного чата. Возвращает число удалённых записей."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute("DELETE FROM game_participants WHERE chat_id = ?", (chat_id,))
+        return cursor.rowcount
+
+
+def clear_game_participants_by_chat(chat_id: int) -> int:
+    """Удаляет всех участников лобби для указанного чата. Возвращает число удалённых записей."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute("DELETE FROM game_participants WHERE chat_id = ?", (chat_id,))
+        return cursor.rowcount
+
+
 def get_game_player(game_id: int, user_id: int) -> dict[str, Any] | None:
     """Возвращает одну запись игрока по game_id и user_id."""
     with _db_lock, _connect() as conn:
@@ -882,3 +929,37 @@ def get_top_wins(limit: int = 10) -> list[dict[str, Any]]:
     with _db_lock, _connect() as conn:
         rows = conn.execute("SELECT user_id, wins FROM wins ORDER BY wins DESC LIMIT ?", (limit,)).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_user_active_game(user_id: int) -> dict[str, Any] | None:
+    """Возвращает активную игру и её chat_id, если пользователь участвует в ней и жив."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT g.id AS game_id, g.chat_id
+            FROM games g
+            JOIN game_players gp ON gp.game_id = g.id
+            WHERE g.status = 'active' AND gp.user_id = ? AND gp.alive = 1
+            ORDER BY g.id DESC LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_game_status(game_id: int, status: str) -> None:
+    """Устанавливает статус игры (active/finished/etc)."""
+    with _db_lock, _connect() as conn:
+        conn.execute("UPDATE games SET status = ? WHERE id = ?", (status, game_id))
+
+
+def get_game_by_id(game_id: int) -> dict[str, Any] | None:
+    with _db_lock, _connect() as conn:
+        row = conn.execute("SELECT id, chat_id, status, created_at, finished_at FROM games WHERE id = ?", (game_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_user(user_id: int) -> dict[str, Any] | None:
+    with _db_lock, _connect() as conn:
+        row = conn.execute("SELECT id, username, first_name FROM users WHERE id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None

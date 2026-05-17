@@ -86,18 +86,30 @@ async def cmd_award(message: Message, command: CommandObject, bot: Bot) -> None:
 
     if not title:
         title = "Заслуженная награда"
+    # Поддерживаем расширенный формат: Название | emoji | Описание | rarity
+    parts = [p.strip() for p in title.split("|") if p.strip()]
+    title_text = parts[0] if parts else "Заслуженная награда"
+    emoji = parts[1] if len(parts) >= 2 else None
+    description = parts[2] if len(parts) >= 3 else None
+    rarity = parts[3].lower() if len(parts) >= 4 else None
 
-    award_id = db.add_award(target_id, message.chat.id, title, message.from_user.id)
+    award_id = db.add_award(target_id, message.chat.id, title_text, message.from_user.id, emoji=emoji, description=description, rarity=rarity)
     target_label = (
         mention_from_user(message.reply_to_message.from_user)
         if message.reply_to_message and message.reply_to_message.from_user
         else await mention_by_id(bot, target_id)
     )
-    await message.answer(
-        f"🏆 Награда выдана пользователю {target_label}.\n"
-        f"ID награды: <code>{award_id}</code>\n"
-        f"Название: <b>{escape(title)}</b>"
-    )
+    rarity_names = {"common": "Обычная", "rare": "Редкая", "epic": "Эпическая", "legendary": "Легендарная"}
+    rarity_label = rarity_names.get(rarity, "Обычная") if rarity else "Обычная"
+    lines = [f"🏆 Награда выдана пользователю {target_label}.", f"ID: <code>{award_id}</code>"]
+    if emoji:
+        lines.append(f"{emoji} <b>{escape(title_text)}</b> — <i>{rarity_label}</i>")
+    else:
+        lines.append(f"<b>{escape(title_text)}</b> — <i>{rarity_label}</i>")
+    if description:
+        lines.append(escape(description))
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(Command("awards"))
@@ -122,10 +134,16 @@ async def cmd_awards(message: Message, command: CommandObject, bot: Bot) -> None
     lines = [f"🏆 <b>Награды пользователя {target_label}</b>"]
     for award in awards[:30]:
         issuer_label = await mention_by_id(bot, int(award["issuer_id"]))
-        lines.append(
-            f"\n<b>#{award['id']}</b> {escape(str(award['title']))}\n"
-            f"Выдал: {issuer_label}"
-        )
+        emoji = award.get("emoji") or ""
+        desc = award.get("description") or ""
+        rarity = (award.get("rarity") or "common").lower()
+        rarity_names = {"common": "Обычная", "rare": "Редкая", "epic": "Эпическая", "legendary": "Легендарная"}
+        rarity_label = rarity_names.get(rarity, "Обычная")
+        title = escape(str(award["title"]))
+        lines.append(f"\n<b>#{award['id']}</b> {emoji} <b>{title}</b> — <i>{rarity_label}</i>")
+        if desc:
+            lines.append(f"{escape(desc)}")
+        lines.append(f"Выдал: {issuer_label}")
     await message.answer("\n".join(lines))
 
 

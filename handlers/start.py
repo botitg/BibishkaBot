@@ -38,6 +38,144 @@ pending_last_word: dict[int, dict] = {}
 # Задачи-таймауты для ожидания последнего слова
 pending_last_word_tasks: dict[int, asyncio.Task] = {}
 
+# Состояния запущенных игр: game_id -> state
+game_states: dict[int, dict] = {}
+# Фоновые задачи игры: game_id -> asyncio.Task
+game_tasks: dict[int, asyncio.Task] = {}
+
+# Лобби: chat_id -> asyncio.Task
+lobby_tasks: dict[int, asyncio.Task] = {}
+# Требуемое количество игроков и время ожидания старта (в секундах)
+LOBBY_MIN_PLAYERS = 6
+LOBBY_WAIT = 60
+
+# Длительности фаз (в секундах)
+NIGHT_DURATION = 30
+DAY_DURATION = 60
+
+
+async def _check_victory(game_id: int) -> str | None:
+    """Проверяет условие победы и возвращает 'mafia' или 'village' либо None."""
+    players = db.get_game_players(game_id)
+    mafia_alive = sum(1 for p in players if int(p.get("alive", 1)) and p.get("role") == "mafia")
+    village_alive = sum(1 for p in players if int(p.get("alive", 1)) and p.get("role") != "mafia")
+    if mafia_alive == 0:
+        return "village"
+    if mafia_alive >= village_alive:
+        return "mafia"
+    return None
+
+
+async def _start_game_loop(game_id: int, chat_id: int, bot: Bot) -> None:
+    """Основной цикл игры: ночи и дни, обработка ночных действий."""
+    if game_id in game_tasks:
+        return
+
+    async def _loop():
+        try:
+            # Инициализация состояния
+            game_states[game_id] = {
+                "phase": "night",
+                "mafia_votes": {},  # voter_id -> target_id
+                "doctor_save": None,
+                "detective_checks": {},
+                "chat_id": chat_id,
+            }
+
+            while True:
+                # НОЧЬ
+                state = game_states.get(game_id)
+                if state is None:
+                    break
+                state["phase"] = "night"
+                state["mafia_votes"] = {}
+                state["doctor_save"] = None
+                state["detective_checks"] = {}
+
+                try:
+                    await bot.send_message(chat_id, f"🌙 Ночь наступила. Мафия, доктор и детектив — действуйте в ЛС. У вас {NIGHT_DURATION} секунд.")
+                except Exception:
+                    logger.exception("Не удалось отправить уведомление о ночи в чат %s", chat_id)
+
+                await asyncio.sleep(NIGHT_DURATION)
+
+                # Обработка ночных действий
+                mafia_votes = state.get("mafia_votes", {})
+                target_counts: dict[int, int] = {}
+                for voter, tgt in mafia_votes.items():
+                    if tgt is None:
+                        continue
+                    target_counts[tgt] = target_counts.get(tgt, 0) + 1
+
+                mafia_target = None
+                if target_counts:
+                    mafia_target = max(target_counts.items(), key=lambda x: x[1])[0]
+
+                doctor_save = state.get("doctor_save")
+
+                # Применяем результат ночи
+                if mafia_target is not None:
+                    # Проверяем, спас ли доктор
+                    if doctor_save is not None and int(doctor_save) == int(mafia_target):
+                        # Спасён
+                        try:
+                            mention = await mention_by_id(bot, mafia_target)
+                            await bot.send_message(chat_id, f"🛡️ Ночью была попытка убийства {mention}, но он(а) спасён(а).")
+                        except Exception:
+                            logger.exception("Не удалось отправить сообщение о спасении")
+                    else:
+                        # Убит
+                        db.set_player_alive(game_id, int(mafia_target), False)
+                        try:
+                            mention = await mention_by_id(bot, mafia_target)
+                            await bot.send_message(chat_id, f"⚰️ Ночью был(а) убит(а) {mention}.")
+                        except Exception:
+                            logger.exception("Не удалось отправить сообщение о ночном убийстве")
+
+                # Проверяем победу
+                winner = await _check_victory(game_id)
+                if winner:
+                    db.finish_game(game_id, winner)
+                    await bot.send_message(chat_id, f"🏁 Игра завершена. Победила: {'мафия' if winner == 'mafia' else 'мирные'}")
+                    # Отобразить топ
+                    top = db.get_top_wins(10)
+                    if top:
+                        lines = ["🏆 <b>Топ побед</b>\n"]
+                        for index, row in enumerate(top, start=1):
+                            uid = int(row["user_id"])
+                            wins = int(row["wins"])
+                            mention = await mention_by_id(bot, uid)
+                            lines.append(f"{index}. {mention} — {wins} побед")
+                        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+                    break
+
+                # ДЕНЬ
+                state["phase"] = "day"
+                try:
+                    await bot.send_message(chat_id, f"☀️ День. Обсуждайте и голосуйте. Для примера лидеры могут использовать /lynch для казни. У вас {DAY_DURATION} секунд до следующей ночи.")
+                except Exception:
+                    logger.exception("Не удалось отправить сообщение о дне в чат %s", chat_id)
+
+                await asyncio.sleep(DAY_DURATION)
+
+                # После дня проверяем, возможно кто-то был повешен через /lynch; проверим победу и продолжим цикл
+                winner = await _check_victory(game_id)
+                if winner:
+                    db.finish_game(game_id, winner)
+                    await bot.send_message(chat_id, f"🏁 Игра завершена. Победила: {'мафия' if winner == 'mafia' else 'мирные'}")
+                    break
+
+            # Очистка состояния
+            game_states.pop(game_id, None)
+            game_tasks.pop(game_id, None)
+        except asyncio.CancelledError:
+            logger.info("Game loop cancelled for %s", game_id)
+        except Exception:
+            logger.exception("Ошибка в игровом цикле для game_id=%s", game_id)
+
+    task = asyncio.create_task(_loop())
+    game_tasks[game_id] = task
+
 
 async def _finalize_death(bot: Bot, chat_id: int, game_id: int, user_id: int, last_word: str | None) -> None:
     """Финализирует смерть игрока: записывает последнее слово и отмечает мёртвым, публикует в чате."""
@@ -55,6 +193,18 @@ async def _finalize_death(bot: Bot, chat_id: int, game_id: int, user_id: int, la
         await bot.send_message(chat_id, text, parse_mode="HTML")
     except Exception:
         logger.exception("Не удалось отправить сообщение о выбытии игрока в чат")
+    # Проверяем условие победы и при необходимости завершаем игру
+    try:
+        winner = await _check_victory(game_id)
+        if winner:
+            db.finish_game(game_id, winner)
+            await bot.send_message(chat_id, f"🏁 Игра завершена. Победила: {'мафия' if winner == 'mafia' else 'мирные'}")
+            # отменяем фоновую таску игры
+            task = game_tasks.get(game_id)
+            if task:
+                task.cancel()
+    except Exception:
+        logger.exception("Ошибка при проверке победы после выбытия игрока")
 
 
 def _schedule_last_word_timeout(user_id: int, delay: int, bot: Bot, chat_id: int, game_id: int) -> None:
@@ -156,6 +306,8 @@ async def cmd_start(message: Message, bot: Bot, command: CommandObject | None = 
                 try:
                     mention = await mention_by_id(bot, message.from_user.id)
                     await bot.send_message(chat_id, f"✅ {mention} присоединился к игре.")
+                    # Проверяем лобби и при необходимости запускаем таймер/старт
+                    await _maybe_trigger_lobby(chat_id, bot)
                 except Exception:
                     logger.exception("Не удалось уведомить чат о присоединении участника")
             else:
@@ -303,6 +455,8 @@ async def callback_game_join(callback: CallbackQuery, bot: Bot) -> None:
         if added:
             await callback.answer("✅ Вы присоединились к игре.")
             await bot.send_message(chat_id, f"✅ {mention} присоединился к игре.", parse_mode="HTML")
+            # Проверяем лобби и при необходимости запускаем таймер/старт
+            await _maybe_trigger_lobby(chat_id, bot)
         else:
             await callback.answer("ℹ️ Вы уже участвуете в этой игре.")
         return
@@ -354,6 +508,7 @@ async def cmd_join(message: Message, bot: Bot, command: CommandObject | None = N
     added = db.add_game_participant(message.from_user.id, message.from_user.username, chat_id_arg)
     if added:
         await message.answer("✅ Вы успешно присоединились к игре! Удачи!", reply_markup=back_to_main_keyboard())
+        await _maybe_trigger_lobby(chat_id_arg, bot)
     else:
         await message.answer("ℹ️ Вы уже участвуете в игре.", reply_markup=back_to_main_keyboard())
 
@@ -365,80 +520,26 @@ async def cmd_startgame(message: Message, bot: Bot) -> None:
         await message.answer("Эту команду нужно использовать в групповом чате.")
         return
     chat_id = message.chat.id
+    # Не позволяем запускать новую игру, если уже есть активная
+    if db.get_active_game(chat_id):
+        await message.answer("⚠️ Игра уже запущена в этом чате. Используйте кнопку 'Участники' чтобы посмотреть список.")
+        return
     participants = db.list_game_participants(500, chat_id)
 
-    # Если достаточно участников, начинаем игру: распределяем роли и отправляем ЛС
-    if len(participants) >= 4:
-        player_count = len(participants)
-        mafia_count = max(1, player_count // 4)
+    # Создаём объявление лобби и клавиатуру присоединения (без прямой кнопки "Написать в ЛС")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Присоединиться", callback_data=f"game:join:{message.chat.id}")
+    builder.button(text="👥 Участники", callback_data=f"game:participants:{message.chat.id}")
+    builder.adjust(2)
 
-        # Формируем список ролей
-        roles: list[str] = ["mafia"] * mafia_count
-        remaining = player_count - mafia_count
-        if remaining >= 2:
-            roles += ["detective", "doctor"]
-            remaining -= 2
-        elif remaining == 1:
-            roles += ["detective"]
-            remaining -= 1
-        roles += ["civilian"] * remaining
+    await message.answer(
+        f"🎮 Лобби для мафии создано! Нажмите 'Присоединиться'. Игра автоматически начнётся при наборе минимум {LOBBY_MIN_PLAYERS} игроков или через {LOBBY_WAIT} секунд.",
+        reply_markup=builder.as_markup(),
+    )
 
-        # Перемешиваем и создаём игру
-        random.shuffle(roles)
-        game_id = db.create_game(chat_id)
-
-        # Добавляем игроков в игру
-        for i, p in enumerate(participants):
-            uid = int(p["user_id"])
-            username = p.get("username")
-            role = roles[i]
-            db.add_game_player(game_id, uid, username, role)
-
-        # Сообщаем роли в ЛС (и удаляем из игры тех, кому не удалось отправить ЛС)
-        mafia_ids = [int(p["user_id"]) for i, p in enumerate(participants) if roles[i] == "mafia"]
-        removed = []
-        for i, p in enumerate(participants):
-            uid = int(p["user_id"])
-            role = roles[i]
-            try:
-                if role == "mafia":
-                    others = [m for m in mafia_ids if m != uid]
-                    mentions = [await mention_by_id(bot, m) for m in others]
-                    text = (
-                        f"🎭 Ваша роль: <b>Мафия</b>.\n"
-                        f"Ваша команда: {', '.join(mentions) if mentions else 'вы один(а)'}\n"
-                        "Действуйте ночью и координируйтесь через этот бот в личке."
-                    )
-                elif role == "detective":
-                    text = (
-                        "🔎 Ваша роль: <b>Детектив</b>.\n"
-                        "Каждую ночь вы можете проверить одного игрока. Ведите записи в ЛС."
-                    )
-                elif role == "doctor":
-                    text = (
-                        "💊 Ваша роль: <b>Доктор</b>.\n"
-                        "Каждую ночь вы можете спасти одного игрока. Действуйте в ЛС."
-                    )
-                else:
-                    text = (
-                        "🙂 Ваша роль: <b>Мирный</b>.\n"
-                        "Цель — вычислить мафию и сохранить жизнь городу. Удачи!"
-                    )
-
-                await bot.send_message(uid, text, parse_mode="HTML")
-            except Exception:
-                # не удалось отправить ЛС — удаляем игрока из игры
-                logger.exception("Не удалось отправить роль в ЛС игроку %s", uid)
-                db.remove_game_player(game_id, uid)
-                removed.append(uid)
-
-        if removed:
-            await message.answer(
-                "⚠️ Некоторым игрокам не удалось отправить роль в ЛС — они удалены из игры. Убедитесь, что все участники нажали 'Присоединиться' и открыли бота.",
-            )
-
-        await message.answer(f"🎮 Игра началась в чате — роли отправлены в ЛС. Участников: {player_count - len(removed)}")
-        return
+    # Всегда запускаем лобби-таймер; если игроков уже достаточно — _maybe_trigger_lobby ускорит старт
+    _schedule_lobby(chat_id, bot)
+    await _maybe_trigger_lobby(chat_id, bot)
 
     # Иначе — просто показываем приглашение присоединиться
     me = await bot.get_me()
@@ -450,7 +551,7 @@ async def cmd_startgame(message: Message, bot: Bot) -> None:
     builder.button(text="➕ Присоединиться", callback_data=f"game:join:{message.chat.id}")
     # Кнопка для открытия ЛС (если нужно написать боту и нажать Start)
     if url:
-        builder.button(text="✉️ Написать в ЛС", url=url)
+        builder.button(text="🔗 Открыть бота", url=url)
     builder.button(text="👥 Участники", callback_data=f"game:participants:{message.chat.id}")
     builder.adjust(2)
 
@@ -485,6 +586,131 @@ async def callback_game_participants(callback: CallbackQuery, bot: Bot) -> None:
             await bot.send_message(chat_id or callback.message.chat.id, text, parse_mode="HTML")
     elif chat_id is not None:
         await bot.send_message(chat_id, text, parse_mode="HTML")
+
+
+async def _start_game_now(chat_id: int, bot: Bot) -> None:
+    """Создаёт игру прямо сейчас из текущих участников чата."""
+    # очистка лобби таски
+    task = lobby_tasks.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
+
+    participants = db.list_game_participants(500, chat_id)
+    if len(participants) < LOBBY_MIN_PLAYERS:
+        await bot.send_message(chat_id, f"❗ Не набралось минимум {LOBBY_MIN_PLAYERS} игроков — игра отменена.")
+        try:
+            db.clear_game_participants_by_chat(chat_id)
+        except Exception:
+            logger.exception("Не удалось очистить участников лобби для чата %s", chat_id)
+        return
+
+    player_count = len(participants)
+    mafia_count = max(1, player_count // 4)
+
+    roles: list[str] = ["mafia"] * mafia_count
+    remaining = player_count - mafia_count
+    if remaining >= 2:
+        roles += ["detective", "doctor"]
+        remaining -= 2
+    elif remaining == 1:
+        roles += ["detective"]
+        remaining -= 1
+    roles += ["civilian"] * remaining
+
+    random.shuffle(roles)
+    game_id = db.create_game(chat_id)
+
+    for i, p in enumerate(participants):
+        uid = int(p["user_id"])
+        username = p.get("username")
+        role = roles[i]
+        db.add_game_player(game_id, uid, username, role)
+
+    mafia_ids = [int(p["user_id"]) for i, p in enumerate(participants) if roles[i] == "mafia"]
+    removed = []
+    for i, p in enumerate(participants):
+        uid = int(p["user_id"])
+        role = roles[i]
+        try:
+            if role == "mafia":
+                others = [m for m in mafia_ids if m != uid]
+                mentions = [await mention_by_id(bot, m) for m in others]
+                text = (
+                    f"🎭 Ваша роль: <b>Мафия</b>.\n"
+                    f"Ваша команда: {', '.join(mentions) if mentions else 'вы один(а)'}\n"
+                    "Действуйте ночью и координируйтесь через этот бот в личке."
+                )
+            elif role == "detective":
+                text = (
+                    "🔎 Ваша роль: <b>Детектив</b>.\n"
+                    "Каждую ночь вы можете проверить одного игрока. Ведите записи в ЛС."
+                )
+            elif role == "doctor":
+                text = (
+                    "💊 Ваша роль: <b>Доктор</b>.\n"
+                    "Каждую ночь вы можете спасти одного игрока. Действуйте в ЛС."
+                )
+            else:
+                text = (
+                    "🙂 Ваша роль: <b>Мирный</b>.\n"
+                    "Цель — вычислить мафию и сохранить жизнь городу. Удачи!"
+                )
+
+            await bot.send_message(uid, text, parse_mode="HTML")
+        except Exception:
+            logger.exception("Не удалось отправить роль в ЛС игроку %s", uid)
+            db.remove_game_player(game_id, uid)
+            removed.append(uid)
+
+    if removed:
+        await bot.send_message(chat_id, "⚠️ Некоторым игрокам не удалось отправить роль в ЛС — они удалены из игры. Убедитесь, что все участники открыли бота.")
+
+    await bot.send_message(chat_id, f"🎮 Игра началась в чате — роли отправлены в ЛС. Участников: {player_count - len(removed)}")
+    await _start_game_loop(game_id, chat_id, bot)
+
+
+def _schedule_lobby(chat_id: int, bot: Bot) -> None:
+    """Запускает лобби-таймер, если он ещё не запущен."""
+    if chat_id in lobby_tasks:
+        return
+
+    async def _wait():
+        try:
+            await bot.send_message(chat_id, f"Лобби создано. Ожидается минимум {LOBBY_MIN_PLAYERS} игроков. Игра начнётся автоматически либо когда соберётся {LOBBY_MIN_PLAYERS} игроков, либо через {LOBBY_WAIT} секунд.")
+            await asyncio.sleep(LOBBY_WAIT)
+            # по окончании тайма пытаемся стартовать
+            await _start_game_now(chat_id, bot)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Ошибка в лобби для чата %s", chat_id)
+
+    task = asyncio.create_task(_wait())
+    lobby_tasks[chat_id] = task
+
+
+async def _maybe_trigger_lobby(chat_id: int, bot: Bot) -> None:
+    """Проверяет количество участников и запускает старт игры/лобби при достижении порога."""
+    participants = db.list_game_participants(500, chat_id)
+    count = len(participants)
+    if count >= LOBBY_MIN_PLAYERS:
+        # Если лобби уже запущено — позволим таймеру завершить или немедленно стартуем, но ставим краткую задержку 60 секунд
+        if chat_id in lobby_tasks:
+            # уже есть лобби — ничего не делаем, дождёмся таймера
+            return
+        # Запланировать старт через LOBBY_WAIT секунд
+        async def _delayed_start():
+            try:
+                await asyncio.sleep(LOBBY_WAIT)
+                await _start_game_now(chat_id, bot)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Ошибка при отложенном старте игры в чате %s", chat_id)
+
+        task = asyncio.create_task(_delayed_start())
+        lobby_tasks[chat_id] = task
+        await bot.send_message(chat_id, f"✅ Набрано {count} игроков — игра начнётся через {LOBBY_WAIT} секунд.")
 
 
 @router.message(Command("lynch"), AdminFilter())
@@ -667,3 +893,121 @@ async def private_message_prompt(message: Message) -> None:
             "Чтобы присоединиться к игре: откройте сообщение 'Игра' в чате и нажмите кнопку 'Присоединиться', затем нажмите /start у бота; либо отправьте `/join CHAT_ID` в эту ЛС.",
             reply_markup=back_to_main_keyboard(),
         )
+
+
+@router.message(Command("kill"))
+async def pm_kill(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
+    """Мафия выбирает цель ночью через ЛС: /kill USER_ID или ответом на сообщение."""
+    if message.chat.type != ChatType.PRIVATE or message.from_user is None:
+        return
+
+    user_id = message.from_user.id
+    # Найдём активную игру пользователя
+    ug = db.get_user_active_game(user_id)
+    if not ug:
+        await message.answer("Вы не участвуете в активной игре.")
+        return
+
+    game_id = int(ug["game_id"])
+    state = game_states.get(game_id)
+    if not state or state.get("phase") != "night":
+        await message.answer("Сейчас не ночь. Вы можете действовать только ночью.")
+        return
+
+    player = db.get_game_player(game_id, user_id)
+    if not player or player.get("role") != "mafia":
+        await message.answer("Команда доступна только мафии.")
+        return
+
+    target_id = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    elif command and getattr(command, "args", None):
+        arg = command.args.strip()
+        if arg.isdigit():
+            target_id = int(arg)
+
+    if target_id is None:
+        await message.answer("Использование: /kill USER_ID или ответьте на сообщение игрока.")
+        return
+
+    state["mafia_votes"][user_id] = int(target_id)
+    await message.answer("Ваш выбор принят.")
+
+
+@router.message(Command("save"))
+async def pm_save(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
+    """Доктор сохраняет игрока ночью: /save USER_ID или ответом на сообщение."""
+    if message.chat.type != ChatType.PRIVATE or message.from_user is None:
+        return
+    user_id = message.from_user.id
+    ug = db.get_user_active_game(user_id)
+    if not ug:
+        await message.answer("Вы не участвуете в активной игре.")
+        return
+    game_id = int(ug["game_id"])
+    state = game_states.get(game_id)
+    if not state or state.get("phase") != "night":
+        await message.answer("Сейчас не ночь.")
+        return
+    player = db.get_game_player(game_id, user_id)
+    if not player or player.get("role") != "doctor":
+        await message.answer("Команда доступна только доктору.")
+        return
+
+    target_id = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    elif command and getattr(command, "args", None):
+        arg = command.args.strip()
+        if arg.isdigit():
+            target_id = int(arg)
+
+    if target_id is None:
+        await message.answer("Использование: /save USER_ID или ответьте на сообщение игрока.")
+        return
+
+    state["doctor_save"] = int(target_id)
+    await message.answer("Ваш выбор сохранения принят.")
+
+
+@router.message(Command("check"))
+async def pm_check(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
+    """Детектив проверяет игрока ночью: /check USER_ID или ответом на сообщение. Результат в ЛС."""
+    if message.chat.type != ChatType.PRIVATE or message.from_user is None:
+        return
+    user_id = message.from_user.id
+    ug = db.get_user_active_game(user_id)
+    if not ug:
+        await message.answer("Вы не участвуете в активной игре.")
+        return
+    game_id = int(ug["game_id"])
+    state = game_states.get(game_id)
+    if not state or state.get("phase") != "night":
+        await message.answer("Сейчас не ночь.")
+        return
+    player = db.get_game_player(game_id, user_id)
+    if not player or player.get("role") != "detective":
+        await message.answer("Команда доступна только детективу.")
+        return
+
+    target_id = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    elif command and getattr(command, "args", None):
+        arg = command.args.strip()
+        if arg.isdigit():
+            target_id = int(arg)
+
+    if target_id is None:
+        await message.answer("Использование: /check USER_ID или ответьте на сообщение игрока.")
+        return
+
+    target = db.get_game_player(game_id, int(target_id))
+    if not target:
+        await message.answer("Игрок не найден в текущей игре.")
+        return
+
+    role = target.get("role")
+    is_mafia = role == "mafia"
+    await message.answer("Результат проверки: <b>мафия</b>" if is_mafia else "Результат проверки: <b>не мафия</b>", parse_mode="HTML")
