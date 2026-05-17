@@ -327,7 +327,8 @@ async def callback_game_participants(callback: CallbackQuery, bot: Bot) -> None:
     if not participants:
         text = "👥 Участников пока нет."
     else:
-        lines = ["👥 <b>Участники игры</b>\n"]
+        count = len(participants)
+        lines = [f"👥 <b>Участники игры</b> — <b>{count}</b>\n"]
         for p in participants:
             mention = await mention_by_id(bot, int(p["user_id"]))
             lines.append(f"• {mention}")
