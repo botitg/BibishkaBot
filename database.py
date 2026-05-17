@@ -704,6 +704,16 @@ def is_game_participant(user_id: int, chat_id: int | None) -> bool:
     return row is not None
 
 
+def is_game_participant_global(user_id: int) -> bool:
+    """Проверяет, есть ли пользователь в любой игре."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM game_participants WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
 
 
 def list_game_participants(limit: int = 100, chat_id: int | None = None) -> list[dict[str, Any]]:

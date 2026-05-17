@@ -377,3 +377,17 @@ async def callback_social_item(callback: CallbackQuery) -> None:
         reply_markup=back_to_main_keyboard(),
         parse_mode=None,
     )
+
+
+@router.message(F.chat.type == ChatType.PRIVATE)
+async def private_message_prompt(message: Message) -> None:
+    """Подсказка для пользователей, которые пишут боту в ЛС без нажатия Start/кнопки."""
+    # Игнорируем команды — они обрабатываются отдельно
+    if message.text and message.text.startswith("/"):
+        return
+
+    if message.from_user and not db.is_game_participant_global(message.from_user.id):
+        await message.answer(
+            "Чтобы присоединиться к игре: откройте сообщение 'Игра' в чате и нажмите кнопку 'Присоединиться', затем нажмите /start у бота; либо отправьте `/join CHAT_ID` в эту ЛС.",
+            reply_markup=back_to_main_keyboard(),
+        )
