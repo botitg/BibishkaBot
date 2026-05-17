@@ -8,7 +8,7 @@ from html import escape
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -86,7 +86,7 @@ async def _format_staff(bot: Bot, chat_id: int | None = None) -> str:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, bot: Bot) -> None:
+async def cmd_start(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
     """Показывает приветствие и главное меню.
 
     Если запуск с payload типа `join_<chat_id>`, регистрирует пользователя в игре
@@ -97,10 +97,13 @@ async def cmd_start(message: Message, bot: Bot) -> None:
 
     # Обработка deep-link /start join_{chat_id}
     payload = None
-    if message.text:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) == 2:
-            payload = parts[1].strip()
+    if command and getattr(command, "args", None):
+        payload = command.args
+    else:
+        if message.text:
+            parts = message.text.split(maxsplit=1)
+            if len(parts) == 2:
+                payload = parts[1].strip()
 
     if payload and payload.startswith("join_") and message.chat.type == ChatType.PRIVATE:
         try:
@@ -109,7 +112,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             chat_id = None
 
         if chat_id is not None and message.from_user:
-            added = db.add_game_participant(message.from_user.id, message.from_user.username)
+            added = db.add_game_participant(message.from_user.id, message.from_user.username, chat_id)
             if added:
                 await message.answer("✅ Вы успешно присоединились к игре! Удачи!", reply_markup=back_to_main_keyboard())
                 # Уведомим чат о новом участнике
@@ -248,7 +251,7 @@ async def callback_game_join(callback: CallbackQuery, bot: Bot) -> None:
 
 
 @router.message(Command("join"))
-async def cmd_join(message: Message, bot: Bot) -> None:
+async def cmd_join(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
     """Команда /join — если в группе, просим открыть ЛС, если в личке — регистрируем участника."""
     if message.chat.type != ChatType.PRIVATE:
         me = await bot.get_me()
@@ -266,14 +269,28 @@ async def cmd_join(message: Message, bot: Bot) -> None:
         await message.answer("Не удалось определить пользователя.")
         return
 
-    added = db.add_game_participant(message.from_user.id, message.from_user.username)
+    # Если команда /join пришла с аргументом (ID чата), используем его, иначе просим воспользоваться ссылкой
+    chat_id_arg = None
+    if command and getattr(command, "args", None):
+        arg = command.args.strip()
+        if arg.isdigit():
+            chat_id_arg = int(arg)
+
+    if chat_id_arg is None:
+        await message.answer(
+            "Чтобы присоединиться к конкретной игре, откройте сообщение об игре в чате и нажмите кнопку 'Присоединиться' или используйте ссылку оттуда.",
+            reply_markup=back_to_main_keyboard(),
+        )
+        return
+
+    added = db.add_game_participant(message.from_user.id, message.from_user.username, chat_id_arg)
     if added:
         await message.answer("✅ Вы успешно присоединились к игре! Удачи!", reply_markup=back_to_main_keyboard())
     else:
         await message.answer("ℹ️ Вы уже участвуете в игре.", reply_markup=back_to_main_keyboard())
 
 
-@router.message(Command("startgame"), AdminFilter())
+@router.message(Command("startgame"))
 async def cmd_startgame(message: Message, bot: Bot) -> None:
     """Запускает объявление об игре в чате с кнопкой присоединиться."""
     if message.chat.type == ChatType.PRIVATE:
@@ -306,7 +323,7 @@ async def callback_game_participants(callback: CallbackQuery, bot: Bot) -> None:
     except Exception:
         chat_id = None
 
-    participants = db.list_game_participants(200)
+    participants = db.list_game_participants(200, chat_id)
     if not participants:
         text = "👥 Участников пока нет."
     else:

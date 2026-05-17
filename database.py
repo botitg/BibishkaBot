@@ -144,6 +144,38 @@ def _remove_removed_faq(conn: sqlite3.Connection) -> None:
             (f"%{token}%", f"%{token}%"),
         )
 
+        # Миграция таблицы game_participants: если старой схемы без chat_id
+        try:
+            info = conn.execute("PRAGMA table_info(game_participants)").fetchall()
+            cols = [row[1] for row in info] if info else []
+            if info and "chat_id" not in cols:
+                # Создаём новую таблицу с нужной схемой и переносим данные
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS game_participants_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        username TEXT,
+                        chat_id INTEGER NOT NULL DEFAULT 0,
+                        joined_at TEXT NOT NULL,
+                        UNIQUE(user_id, chat_id)
+                    );
+                    """
+                )
+                rows = conn.execute(
+                    "SELECT id, user_id, username, joined_at FROM game_participants"
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO game_participants_new (user_id, username, chat_id, joined_at) VALUES (?, ?, ?, ?)",
+                        (row[1], row[2], 0, row[3]),
+                    )
+                conn.execute("DROP TABLE game_participants")
+                conn.execute("ALTER TABLE game_participants_new RENAME TO game_participants")
+        except Exception:
+            # Если чего-то не получилось — просто логируем и продолжаем
+            logger.debug("Нет необходимости мигрировать game_participants или миграция не удалась", exc_info=True)
+
 
 def _ensure_default_faq(conn: sqlite3.Connection) -> None:
     """Создает стартовые FAQ и добавляет новые обязательные записи без дублей."""
@@ -247,9 +279,11 @@ def init_db(admin_ids: list[int] | None = None) -> None:
             
             CREATE TABLE IF NOT EXISTS game_participants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
                 username TEXT,
-                joined_at TEXT NOT NULL
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                joined_at TEXT NOT NULL,
+                UNIQUE(user_id, chat_id)
             );
             """
         )
@@ -639,36 +673,53 @@ def delete_award(award_id: int) -> bool:
     return cursor.rowcount > 0
 
 
-def add_game_participant(user_id: int, username: str | None) -> bool:
-    """Добавляет пользователя в список участников игры. Возвращает True, если добавлен."""
+
+
+def add_game_participant(user_id: int, username: str | None, chat_id: int | None) -> bool:
+    """Добавляет пользователя в список участников игры для конкретного чата.
+    Возвращает True, если запись была вставлена, False если уже есть.
+    """
     joined_at = datetime.utcnow().isoformat(timespec="seconds")
     with _db_lock, _connect() as conn:
         try:
-            conn.execute(
-                "INSERT INTO game_participants (user_id, username, joined_at) VALUES (?, ?, ?)",
-                (user_id, username, joined_at),
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO game_participants (user_id, username, chat_id, joined_at) VALUES (?, ?, ?, ?)",
+                (user_id, username, chat_id or 0, joined_at),
             )
-            return True
+            return cursor.rowcount > 0
         except Exception:
-            # Уже есть или другая ошибка — считаем, что участник не добавлен
+            logger.exception("Не удалось добавить участника игры в БД")
             return False
 
 
-def is_game_participant(user_id: int) -> bool:
-    """Проверяет, участвует ли пользователь в игре."""
+
+
+def is_game_participant(user_id: int, chat_id: int | None) -> bool:
+    """Проверяет, участвует ли пользователь в игре для конкретного чата."""
     with _db_lock, _connect() as conn:
         row = conn.execute(
-            "SELECT id FROM game_participants WHERE user_id = ?",
-            (user_id,),
+            "SELECT id FROM game_participants WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id or 0),
         ).fetchone()
     return row is not None
 
 
-def list_game_participants(limit: int = 100) -> list[dict[str, Any]]:
-    """Возвращает список участников игры."""
+
+
+def list_game_participants(limit: int = 100, chat_id: int | None = None) -> list[dict[str, Any]]:
+    """Возвращает список участников игры.
+
+    Если `chat_id` указан, возвращает участников только для этого чата.
+    """
     with _db_lock, _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, user_id, username, joined_at FROM game_participants ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if chat_id is None:
+            rows = conn.execute(
+                "SELECT id, user_id, username, chat_id, joined_at FROM game_participants ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, user_id, username, chat_id, joined_at FROM game_participants WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit),
+            ).fetchall()
     return [dict(row) for row in rows]
