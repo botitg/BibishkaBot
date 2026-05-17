@@ -30,11 +30,18 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def private_start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
-    """Создает клавиатуру с кнопкой для открытия личных сообщений с ботом."""
+def private_start_keyboard(bot_username: str, chat_id: int | None = None) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопкой для открытия личных сообщений с ботом.
+
+    Если передан `chat_id`, добавляет его в payload (`start=join_{chat_id}`),
+    чтобы при открытии ЛС бот мог зарегистрировать пользователя для конкретного чата.
+    """
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-    url = f"https://t.me/{bot_username}?start=join"
+    if chat_id is not None:
+        url = f"https://t.me/{bot_username}?start=join_{chat_id}"
+    else:
+        url = f"https://t.me/{bot_username}?start=join"
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Написать в ЛС", url=url)]])
 
 

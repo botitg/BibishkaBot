@@ -9,6 +9,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
@@ -23,6 +24,8 @@ from keyboards.inline import (
 from keyboards.reply import user_reply_keyboard
 from states.admin_states import AdRequest
 from utils.users import mention_by_id
+from utils.filters import AdminFilter
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 router = Router()
@@ -83,10 +86,40 @@ async def _format_staff(bot: Bot, chat_id: int | None = None) -> str:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    """Показывает приветствие и главное меню."""
+async def cmd_start(message: Message, bot: Bot) -> None:
+    """Показывает приветствие и главное меню.
+
+    Если запуск с payload типа `join_<chat_id>`, регистрирует пользователя в игре
+    и уведомляет чат о присоединении.
+    """
     if message.from_user:
         db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+
+    # Обработка deep-link /start join_{chat_id}
+    payload = None
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) == 2:
+            payload = parts[1].strip()
+
+    if payload and payload.startswith("join_") and message.chat.type == ChatType.PRIVATE:
+        try:
+            chat_id = int(payload.split("_", 1)[1])
+        except Exception:
+            chat_id = None
+
+        if chat_id is not None and message.from_user:
+            added = db.add_game_participant(message.from_user.id, message.from_user.username)
+            if added:
+                await message.answer("✅ Вы успешно присоединились к игре! Удачи!", reply_markup=back_to_main_keyboard())
+                # Уведомим чат о новом участнике
+                try:
+                    mention = await mention_by_id(bot, message.from_user.id)
+                    await bot.send_message(chat_id, f"✅ {mention} присоединился к игре.")
+                except Exception:
+                    logger.exception("Не удалось уведомить чат о присоединении участника")
+            else:
+                await message.answer("ℹ️ Вы уже участвуете в игре.", reply_markup=back_to_main_keyboard())
 
     text = (
         f"✨ Привет, <b>{_user_name(message)}</b>!\n\n"
@@ -205,9 +238,10 @@ async def callback_game_join(callback: CallbackQuery, bot: Bot) -> None:
     me = await bot.get_me()
     username = getattr(me, "username", None)
     if username:
+        chat_id = callback.message.chat.id if callback.message and callback.message.chat else None
         await callback.message.answer(
             "Чтобы присоединиться к игре, напишите боту в личные сообщения:",
-            reply_markup=private_start_keyboard(username),
+            reply_markup=private_start_keyboard(username, chat_id),
         )
     else:
         await callback.message.answer("Чтобы присоединиться к игре, напишите боту в личку.")
@@ -222,7 +256,7 @@ async def cmd_join(message: Message, bot: Bot) -> None:
         if username:
             await message.answer(
                 "Для участия нажмите кнопку и напишите боту в личку:",
-                reply_markup=private_start_keyboard(username),
+                reply_markup=private_start_keyboard(username, message.chat.id),
             )
         else:
             await message.answer("Для участия напишите боту в личные сообщения.")
@@ -237,6 +271,58 @@ async def cmd_join(message: Message, bot: Bot) -> None:
         await message.answer("✅ Вы успешно присоединились к игре! Удачи!", reply_markup=back_to_main_keyboard())
     else:
         await message.answer("ℹ️ Вы уже участвуете в игре.", reply_markup=back_to_main_keyboard())
+
+
+@router.message(Command("startgame"), AdminFilter())
+async def cmd_startgame(message: Message, bot: Bot) -> None:
+    """Запускает объявление об игре в чате с кнопкой присоединиться."""
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Эту команду нужно использовать в групповом чате.")
+        return
+
+    me = await bot.get_me()
+    username = getattr(me, "username", None)
+    url = f"https://t.me/{username}?start=join_{message.chat.id}" if username else None
+
+    builder = InlineKeyboardBuilder()
+    if url:
+        builder.button(text="🔗 Присоединиться", url=url)
+    else:
+        # fallback: show instruction to write in PM
+        builder.button(text="🔗 Присоединиться (написать в ЛС)", callback_data="game:join")
+    builder.button(text="👥 Участники", callback_data=f"game:participants:{message.chat.id}")
+    builder.adjust(2)
+
+    await message.answer("🎮 Игра началась! Нажмите кнопку ниже, чтобы присоединиться.", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("game:participants:"))
+async def callback_game_participants(callback: CallbackQuery, bot: Bot) -> None:
+    """Показывает список участников (глобально)."""
+    await callback.answer()
+    data = callback.data or ""
+    try:
+        chat_id = int(data.rsplit(":", 1)[1])
+    except Exception:
+        chat_id = None
+
+    participants = db.list_game_participants(200)
+    if not participants:
+        text = "👥 Участников пока нет."
+    else:
+        lines = ["👥 <b>Участники игры</b>\n"]
+        for p in participants:
+            mention = await mention_by_id(bot, int(p["user_id"]))
+            lines.append(f"• {mention}")
+        text = "\n".join(lines)
+
+    if callback.message is not None:
+        try:
+            await callback.message.answer(text, parse_mode="HTML")
+        except Exception:
+            await bot.send_message(chat_id or callback.message.chat.id, text, parse_mode="HTML")
+    elif chat_id is not None:
+        await bot.send_message(chat_id, text, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "main:awards")
