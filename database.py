@@ -341,6 +341,37 @@ def init_db(admin_ids: list[int] | None = None) -> None:
         else:
             _ensure_default_faq(conn)
 
+        # Создаём вспомогательные таблицы для игр и лидеров
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS games (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS game_players (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    game_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    role TEXT,
+                    alive INTEGER NOT NULL DEFAULT 1,
+                    last_word TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS wins (
+                    user_id INTEGER PRIMARY KEY,
+                    wins INTEGER NOT NULL DEFAULT 0
+                );
+                """
+            )
+        except Exception:
+            logger.exception("Не удалось создать таблицы для игр")
+
 
 def add_user(user_id: int, username: str | None, first_name: str | None) -> None:
     """Добавляет пользователя или обновляет его публичные данные."""
@@ -732,4 +763,115 @@ def list_game_participants(limit: int = 100, chat_id: int | None = None) -> list
                 "SELECT id, user_id, username, chat_id, joined_at FROM game_participants WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
                 (chat_id, limit),
             ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_game(chat_id: int) -> int:
+    """Создаёт запись игры и возвращает её ID."""
+    created_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO games (chat_id, status, created_at) VALUES (?, 'active', ?)",
+            (chat_id, created_at),
+        )
+        return int(cursor.lastrowid)
+
+
+def add_game_player(game_id: int, user_id: int, username: str | None, role: str) -> int:
+    """Добавляет игрока в игру."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO game_players (game_id, user_id, username, role, alive) VALUES (?, ?, ?, ?, 1)",
+            (game_id, user_id, username, role),
+        )
+        return int(cursor.lastrowid)
+
+
+def remove_game_player(game_id: int, user_id: int) -> None:
+    """Удаляет игрока из игры (используется если не удалось отправить ЛС)."""
+    with _db_lock, _connect() as conn:
+        conn.execute("DELETE FROM game_players WHERE game_id = ? AND user_id = ?", (game_id, user_id))
+
+
+def get_active_game(chat_id: int) -> dict[str, Any] | None:
+    """Возвращает последнюю активную игру в чате, если есть."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id, chat_id, status, created_at FROM games WHERE chat_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_game_players(game_id: int) -> list[dict[str, Any]]:
+    """Возвращает всех игроков указанной игры."""
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, game_id, user_id, username, role, alive, last_word FROM game_players WHERE game_id = ?",
+            (game_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_game_player(game_id: int, user_id: int) -> dict[str, Any] | None:
+    """Возвращает одну запись игрока по game_id и user_id."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id, game_id, user_id, username, role, alive, last_word FROM game_players WHERE game_id = ? AND user_id = ?",
+            (game_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_player_last_word(game_id: int, user_id: int, last_word: str | None) -> None:
+    """Сохраняет последнее слово игрока."""
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "UPDATE game_players SET last_word = ? WHERE game_id = ? AND user_id = ?",
+            (last_word, game_id, user_id),
+        )
+
+
+def set_player_alive(game_id: int, user_id: int, alive: bool) -> None:
+    """Устанавливает состояние alive для игрока."""
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "UPDATE game_players SET alive = ? WHERE game_id = ? AND user_id = ?",
+            (1 if alive else 0, game_id, user_id),
+        )
+
+
+def finish_game(game_id: int, winnerside: str) -> None:
+    """Завершает игру и добавляет победы в таблицу wins.
+
+    winnerside: 'mafia' или 'village'
+    """
+    finished_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute("UPDATE games SET status = 'finished', finished_at = ? WHERE id = ?", (finished_at, game_id))
+        if winnerside == "mafia":
+            rows = conn.execute("SELECT user_id FROM game_players WHERE game_id = ? AND role = 'mafia'", (game_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT user_id FROM game_players WHERE game_id = ? AND role != 'mafia'", (game_id,)).fetchall()
+
+        for r in rows:
+            uid = int(r[0])
+            try:
+                conn.execute(
+                    "INSERT INTO wins (user_id, wins) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET wins = wins + 1",
+                    (uid,),
+                )
+            except Exception:
+                # fallback for older SQLite versions: read/update
+                cur = conn.execute("SELECT wins FROM wins WHERE user_id = ?", (uid,)).fetchone()
+                if cur:
+                    conn.execute("UPDATE wins SET wins = ? WHERE user_id = ?", (int(cur[0]) + 1, uid))
+                else:
+                    conn.execute("INSERT INTO wins (user_id, wins) VALUES (?, 1)", (uid,))
+
+
+def get_top_wins(limit: int = 10) -> list[dict[str, Any]]:
+    """Возвращает топ победителей по убыванию wins."""
+    with _db_lock, _connect() as conn:
+        rows = conn.execute("SELECT user_id, wins FROM wins ORDER BY wins DESC LIMIT ?", (limit,)).fetchall()
     return [dict(row) for row in rows]

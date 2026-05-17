@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 from html import escape
+import random
+import asyncio
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
@@ -30,6 +32,41 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+# Ожидания последних слов: user_id -> {chat_id, game_id}
+pending_last_word: dict[int, dict] = {}
+# Задачи-таймауты для ожидания последнего слова
+pending_last_word_tasks: dict[int, asyncio.Task] = {}
+
+
+async def _finalize_death(bot: Bot, chat_id: int, game_id: int, user_id: int, last_word: str | None) -> None:
+    """Финализирует смерть игрока: записывает последнее слово и отмечает мёртвым, публикует в чате."""
+    try:
+        db.set_player_last_word(game_id, user_id, last_word)
+        db.set_player_alive(game_id, user_id, False)
+    except Exception:
+        logger.exception("Ошибка при обновлении статуса игрока в БД")
+
+    try:
+        mention = await mention_by_id(bot, user_id)
+        text = f"⚰️ {mention} выбывает."
+        if last_word:
+            text += f"\nПоследнее слово:\n{escape(last_word)}"
+        await bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Не удалось отправить сообщение о выбытии игрока в чат")
+
+
+def _schedule_last_word_timeout(user_id: int, delay: int, bot: Bot, chat_id: int, game_id: int) -> None:
+    async def _timeout():
+        await asyncio.sleep(delay)
+        info = pending_last_word_tasks.pop(user_id, None)
+        # если за это время пользователь не оставил последнее слово, финализируем смерть без текста
+        if pending_last_word.pop(user_id, None) is not None:
+            await _finalize_death(bot, chat_id, game_id, user_id, None)
+
+    task = asyncio.create_task(_timeout())
+    pending_last_word_tasks[user_id] = task
 
 
 async def _safe_edit(callback: CallbackQuery, text: str, reply_markup=None, parse_mode: str | None = "HTML") -> None:
@@ -296,7 +333,83 @@ async def cmd_startgame(message: Message, bot: Bot) -> None:
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Эту команду нужно использовать в групповом чате.")
         return
+    chat_id = message.chat.id
+    participants = db.list_game_participants(500, chat_id)
 
+    # Если достаточно участников, начинаем игру: распределяем роли и отправляем ЛС
+    if len(participants) >= 4:
+        player_count = len(participants)
+        mafia_count = max(1, player_count // 4)
+
+        # Формируем список ролей
+        roles: list[str] = ["mafia"] * mafia_count
+        remaining = player_count - mafia_count
+        if remaining >= 2:
+            roles += ["detective", "doctor"]
+            remaining -= 2
+        elif remaining == 1:
+            roles += ["detective"]
+            remaining -= 1
+        roles += ["civilian"] * remaining
+
+        # Перемешиваем и создаём игру
+        random.shuffle(roles)
+        game_id = db.create_game(chat_id)
+
+        # Добавляем игроков в игру
+        for i, p in enumerate(participants):
+            uid = int(p["user_id"])
+            username = p.get("username")
+            role = roles[i]
+            db.add_game_player(game_id, uid, username, role)
+
+        # Сообщаем роли в ЛС (и удаляем из игры тех, кому не удалось отправить ЛС)
+        mafia_ids = [int(p["user_id"]) for i, p in enumerate(participants) if roles[i] == "mafia"]
+        removed = []
+        for i, p in enumerate(participants):
+            uid = int(p["user_id"])
+            role = roles[i]
+            try:
+                if role == "mafia":
+                    others = [m for m in mafia_ids if m != uid]
+                    mentions = [await mention_by_id(bot, m) for m in others]
+                    text = (
+                        f"🎭 Ваша роль: <b>Мафия</b>.\n"
+                        f"Ваша команда: {', '.join(mentions) if mentions else 'вы один(а)'}\n"
+                        "Действуйте ночью и координируйтесь через этот бот в личке."
+                    )
+                elif role == "detective":
+                    text = (
+                        "🔎 Ваша роль: <b>Детектив</b>.\n"
+                        "Каждую ночь вы можете проверить одного игрока. Ведите записи в ЛС."
+                    )
+                elif role == "doctor":
+                    text = (
+                        "💊 Ваша роль: <b>Доктор</b>.\n"
+                        "Каждую ночь вы можете спасти одного игрока. Действуйте в ЛС."
+                    )
+                else:
+                    text = (
+                        "🙂 Ваша роль: <b>Мирный</b>.\n"
+                        "Цель — вычислить мафию и сохранить жизнь городу. Удачи!"
+                    )
+
+                await bot.send_message(uid, text, parse_mode="HTML")
+            except Exception:
+                # не удалось отправить ЛС — удаляем игрока из игры
+                logger.exception("Не удалось отправить роль в ЛС игроку %s", uid)
+                db.remove_game_player(game_id, uid)
+                removed.append(uid)
+
+        if removed:
+            await message.answer(
+                "⚠️ Некоторым игрокам не удалось отправить роль в ЛС — они удалены из игры. Убедитесь, что все участники нажали 'Присоединиться' и открыли бота.",
+            )
+
+        await message.answer(f"🎮 Игра началась в чате — roles отправлены в ЛС. Участников: {player_count - len(removed)}")
+        return
+
+    # Иначе — просто показываем приглашение присоединиться
     me = await bot.get_me()
     username = getattr(me, "username", None)
     url = f"https://t.me/{username}?start=join_{message.chat.id}" if username else None
@@ -343,6 +456,106 @@ async def callback_game_participants(callback: CallbackQuery, bot: Bot) -> None:
         await bot.send_message(chat_id, text, parse_mode="HTML")
 
 
+@router.message(Command("lynch"), AdminFilter())
+async def cmd_lynch(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
+    """Команда для казни игрока — просит последнее слово и выбывает игрока."""
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Используйте эту команду в групповом чате.")
+        return
+
+    game = db.get_active_game(message.chat.id)
+    if not game:
+        await message.answer("Нет активной игры в этом чате.")
+        return
+
+    target_id = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    elif command and getattr(command, "args", None):
+        arg = command.args.strip()
+        if arg.isdigit():
+            target_id = int(arg)
+
+    if target_id is None:
+        await message.answer("Использование: ответьте на сообщение игрока или /lynch USER_ID")
+        return
+
+    player = db.get_game_player(game["id"], target_id)
+    if not player:
+        await message.answer("Этот пользователь не участвует в текущей игре.")
+        return
+    if int(player.get("alive", 1)) == 0:
+        await message.answer("Этот игрок уже мёртв.")
+        return
+
+    # Отправляем ЛС с просьбой оставить последнее слово
+    pending_last_word[target_id] = {"game_id": game["id"], "chat_id": message.chat.id}
+    try:
+        await bot.send_message(target_id, "⚠️ Вас выбрали для выбытия. У вас есть последнее слово — ответьте этим сообщением в ЛС. У вас 30 секунд.")
+    except Exception:
+        pending_last_word.pop(target_id, None)
+        await message.answer("Не удалось отправить ЛС игроку — убедитесь, что он открыл бота.")
+        return
+
+    _schedule_last_word_timeout(target_id, 30, bot, message.chat.id, game["id"])
+    await message.answer("Игроку отправлен запрос на последнее слово.")
+
+
+@router.message(Command("endgame"), AdminFilter())
+async def cmd_endgame(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
+    """Завершает текущую игру и начисляет победы сторонам."""
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Эту команду нужно использовать в групповом чате.")
+        return
+
+    game = db.get_active_game(message.chat.id)
+    if not game:
+        await message.answer("Нет активной игры в этом чате.")
+        return
+
+    winnerside = "village"
+    if command and getattr(command, "args", None):
+        arg = command.args.strip().lower()
+        if arg in {"mafia", "мафия", "maf"}:
+            winnerside = "mafia"
+
+    db.finish_game(game["id"], winnerside)
+    await message.answer(f"🏁 Игра завершена. Победила: {'мафия' if winnerside == 'mafia' else 'мирные'}")
+
+    # Показать топ побед
+    top = db.get_top_wins(10)
+    if not top:
+        await message.answer("Пока нет статистики побед.")
+        return
+
+    lines = ["🏆 <b>Топ побед</b>\n"]
+    for index, row in enumerate(top, start=1):
+        uid = int(row["user_id"])
+        wins = int(row["wins"])
+        mention = await mention_by_id(bot, uid)
+        lines.append(f"{index}. {mention} — {wins} побед")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("top"))
+async def cmd_top(message: Message, bot: Bot) -> None:
+    """Показывает таблицу лидеров по победам."""
+    top = db.get_top_wins(10)
+    if not top:
+        await message.answer("Пока нет лидеров.")
+        return
+
+    lines = ["🏆 <b>Топ побед</b>\n"]
+    for index, row in enumerate(top, start=1):
+        uid = int(row["user_id"])
+        wins = int(row["wins"])
+        mention = await mention_by_id(bot, uid)
+        lines.append(f"{index}. {mention} — {wins} побед")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @router.callback_query(F.data == "main:awards")
 async def callback_main_awards(callback: CallbackQuery) -> None:
     """Показывает подсказку по наградам."""
@@ -377,6 +590,31 @@ async def callback_social_item(callback: CallbackQuery) -> None:
         reply_markup=back_to_main_keyboard(),
         parse_mode=None,
     )
+
+
+@router.message(F.chat.type == ChatType.PRIVATE)
+async def private_lastword_capture(message: Message, bot: Bot) -> None:
+    """Перехватывает личные сообщения для записи 'последнего слова', если оно ожидается."""
+    if message.from_user is None:
+        return
+
+    user_id = message.from_user.id
+    # Игнорируем команды — они обрабатываются отдельно
+    if message.text and message.text.startswith("/"):
+        return
+
+    if user_id in pending_last_word:
+        info = pending_last_word.pop(user_id)
+        # отменяем таймер, если он есть
+        task = pending_last_word_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        game_id = info.get("game_id")
+        chat_id = info.get("chat_id")
+        last_word_text = message.text or (message.caption or "")
+        await _finalize_death(bot, chat_id, game_id, user_id, last_word_text)
+        return
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
