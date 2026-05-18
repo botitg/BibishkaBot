@@ -168,3 +168,44 @@ async def cmd_unaward(message: Message, command: CommandObject) -> None:
         await message.answer(f"✅ Награда <code>{award_id}</code> удалена.")
     else:
         await message.answer("Награда не найдена.")
+
+
+@router.message(Command("transfer_award"), AdminFilter())
+async def cmd_transfer_award(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Переносит существующую награду другому пользователю.
+
+    Использование:
+    - Ответ на сообщение: ответь на сообщение пользователя и отправь `/transfer_award AWARD_ID`
+    - Без ответа: `/transfer_award AWARD_ID TARGET_USER_ID`
+    """
+    args = (command.args or "").split()
+
+    # Определяем цель (reply или явный ID)
+    target_id = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        # reply -> target is replied user, award id expected in args
+        if not args or not args[0].isdigit():
+            await message.answer("Использование: ответь на сообщение и отправь /transfer_award AWARD_ID или /transfer_award AWARD_ID TARGET_USER_ID")
+            return
+        award_id = int(args[0])
+        target_id = message.reply_to_message.from_user.id
+    else:
+        if len(args) < 2 or not args[0].isdigit() or not args[1].lstrip("-").isdigit():
+            await message.answer("Использование: /transfer_award AWARD_ID TARGET_USER_ID (или ответ + AWARD_ID)")
+            return
+        award_id = int(args[0])
+        target_id = int(args[1])
+
+    award = db.get_award(award_id)
+    if not award:
+        await message.answer("Награда не найдена.")
+        return
+
+    # Выполняем перенос
+    success = db.transfer_award(award_id, target_id)
+    if not success:
+        await message.answer("Не удалось передать награду. Проверьте ID и попробуйте снова.")
+        return
+
+    target_label = await mention_by_id(bot, target_id)
+    await message.answer(f"✅ Награда <code>{award_id}</code> передана пользователю {target_label}.")

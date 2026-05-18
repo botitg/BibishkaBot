@@ -704,3 +704,26 @@ def get_user(user_id: int) -> dict[str, Any] | None:
     with _db_lock, _connect() as conn:
         row = conn.execute("SELECT id, username, first_name FROM users WHERE id = ?", (user_id,)).fetchone()
     return dict(row) if row else None
+
+
+def get_award(award_id: int) -> dict[str, Any] | None:
+    """Возвращает запись награды по ID."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id, user_id, chat_id, title, issuer_id, created_at, emoji, description, rarity FROM awards WHERE id = ?",
+            (award_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def transfer_award(award_id: int, new_user_id: int) -> bool:
+    """Передаёт существующую награду другому пользователю. Возвращает True при успехе."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute("SELECT id, user_id FROM awards WHERE id = ?", (award_id,)).fetchone()
+        if not row:
+            return False
+        current_owner = int(row["user_id"])
+        if current_owner == int(new_user_id):
+            return True
+        conn.execute("UPDATE awards SET user_id = ? WHERE id = ?", (new_user_id, award_id))
+    return True
