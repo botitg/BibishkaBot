@@ -94,18 +94,23 @@ async def cmd_award(message: Message, command: CommandObject, bot: Bot) -> None:
     rarity = parts[3].lower() if len(parts) >= 4 else None
 
     award_id = db.add_award(target_id, message.chat.id, title_text, message.from_user.id, emoji=emoji, description=description, rarity=rarity)
+    if award_id == -1:
+        await message.answer("❗ Такая уникальная награда уже существует — нельзя выдать дубликат.")
+        return
     target_label = (
         mention_from_user(message.reply_to_message.from_user)
         if message.reply_to_message and message.reply_to_message.from_user
         else await mention_by_id(bot, target_id)
     )
-    rarity_names = {"common": "Обычная", "rare": "Редкая", "epic": "Эпическая", "legendary": "Легендарная"}
+    rarity_names = {"common": "Обычная", "rare": "Редкая", "epic": "Эпическая", "mythic": "Мифическая", "ultra": "Ультра", "legendary": "Легендарная"}
     rarity_label = rarity_names.get(rarity, "Обычная") if rarity else "Обычная"
+    points_map = {"common": 1, "rare": 5, "epic": 20, "mythic": 100, "ultra": 500, "legendary": 250}
+    points = points_map.get(rarity, 1)
     lines = [f"🏆 Награда выдана пользователю {target_label}.", f"ID: <code>{award_id}</code>"]
     if emoji:
-        lines.append(f"{emoji} <b>{escape(title_text)}</b> — <i>{rarity_label}</i>")
+        lines.append(f"{emoji} <b>{escape(title_text)}</b> — <i>{rarity_label}</i> — <b>{points} очков</b>")
     else:
-        lines.append(f"<b>{escape(title_text)}</b> — <i>{rarity_label}</i>")
+        lines.append(f"<b>{escape(title_text)}</b> — <i>{rarity_label}</i> — <b>{points} очков</b>")
     if description:
         lines.append(escape(description))
 
@@ -132,15 +137,18 @@ async def cmd_awards(message: Message, command: CommandObject, bot: Bot) -> None
         return
 
     lines = [f"🏆 <b>Награды пользователя {target_label}</b>"]
+    points_map = {"common": 1, "rare": 5, "epic": 20, "mythic": 100, "ultra": 500, "legendary": 250}
     for award in awards[:30]:
         issuer_label = await mention_by_id(bot, int(award["issuer_id"]))
         emoji = award.get("emoji") or ""
         desc = award.get("description") or ""
         rarity = (award.get("rarity") or "common").lower()
-        rarity_names = {"common": "Обычная", "rare": "Редкая", "epic": "Эпическая", "legendary": "Легендарная"}
+        rarity = rarity if rarity else "common"
+        rarity_names = {"common": "Обычная", "rare": "Редкая", "epic": "Эпическая", "mythic": "Мифическая", "ultra": "Ультра", "legendary": "Легендарная"}
         rarity_label = rarity_names.get(rarity, "Обычная")
         title = escape(str(award["title"]))
-        lines.append(f"\n<b>#{award['id']}</b> {emoji} <b>{title}</b> — <i>{rarity_label}</i>")
+        points = points_map.get(rarity, 1)
+        lines.append(f"\n<b>#{award['id']}</b> {emoji} <b>{title}</b> — <i>{rarity_label}</i> — <b>{points} очков</b>")
         if desc:
             lines.append(f"{escape(desc)}")
         lines.append(f"Выдал: {issuer_label}")

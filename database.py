@@ -1,4 +1,8 @@
-"""Работа с SQLite для BIBISHKA Admin Bot."""
+"""Работа с SQLite для BIBISHKA Admin Bot.
+
+Игровой функционал (мафия) удалён — в БД остаются FAQ, пользователи,
+настройки, модерация и награды.
+"""
 
 from __future__ import annotations
 
@@ -77,9 +81,10 @@ DEFAULT_FAQ: list[tuple[str, str]] = [
     ),
     (
         "Реклама,Сотрудничество,Купить рекламу,Пиар",
-        "📣 По рекламе открой раздел «Реклама» в /start и отправь предложение. Оно уйдет ответственному администратору.",
+        "📣 По рекламе открой раздел «Реклама» в /start и отправь одним сообщением: тему, ссылку, сроки и бюджет.",
     ),
 ]
+
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "content_version": "2",
@@ -104,7 +109,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "streams_text": "🎥 Расписание стримов пока уточняется. Следи за новостями в чате и официальных соцсетях Бибишки.",
     "socials_text": "🌐 Соцсети Бибишки можно указать через FAQ: TikTok, Instagram и Telegram.",
     "ads_text": "📣 Чтобы предложить рекламу, нажми «Реклама» и отправь одним сообщением: тему, ссылку, сроки и бюджет.",
-    "ai_enabled": "1",
+    "ai_enabled": "0",
 }
 
 
@@ -143,38 +148,6 @@ def _remove_removed_faq(conn: sqlite3.Connection) -> None:
             "DELETE FROM faq WHERE LOWER(keywords) LIKE ? OR LOWER(answer) LIKE ?",
             (f"%{token}%", f"%{token}%"),
         )
-
-        # Миграция таблицы game_participants: если старой схемы без chat_id
-        try:
-            info = conn.execute("PRAGMA table_info(game_participants)").fetchall()
-            cols = [row[1] for row in info] if info else []
-            if info and "chat_id" not in cols:
-                # Создаём новую таблицу с нужной схемой и переносим данные
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS game_participants_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        username TEXT,
-                        chat_id INTEGER NOT NULL DEFAULT 0,
-                        joined_at TEXT NOT NULL,
-                        UNIQUE(user_id, chat_id)
-                    );
-                    """
-                )
-                rows = conn.execute(
-                    "SELECT id, user_id, username, joined_at FROM game_participants"
-                ).fetchall()
-                for row in rows:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO game_participants_new (user_id, username, chat_id, joined_at) VALUES (?, ?, ?, ?)",
-                        (row[1], row[2], 0, row[3]),
-                    )
-                conn.execute("DROP TABLE game_participants")
-                conn.execute("ALTER TABLE game_participants_new RENAME TO game_participants")
-        except Exception:
-            # Если чего-то не получилось — просто логируем и продолжаем
-            logger.debug("Нет необходимости мигрировать game_participants или миграция не удалась", exc_info=True)
 
 
 def _ensure_default_faq(conn: sqlite3.Connection) -> None:
@@ -278,46 +251,25 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 emoji TEXT DEFAULT '',
                 description TEXT DEFAULT '',
                 rarity TEXT DEFAULT 'common'
-                );
-            
-            CREATE TABLE IF NOT EXISTS game_participants (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                chat_id INTEGER NOT NULL DEFAULT 0,
-                joined_at TEXT NOT NULL,
-                UNIQUE(user_id, chat_id)
             );
             """
         )
 
         # Миграция таблицы admins для добавления полей rank, title, is_hidden
         try:
-            conn.execute(
-                """
-                ALTER TABLE admins ADD COLUMN rank TEXT DEFAULT 'Админ';
-                """
-            )
+            conn.execute("ALTER TABLE admins ADD COLUMN rank TEXT DEFAULT 'Админ';")
         except Exception:
-            pass  # Колонки уже существуют
+            pass
 
         try:
-            conn.execute(
-                """
-                ALTER TABLE admins ADD COLUMN title TEXT DEFAULT '';
-                """
-            )
+            conn.execute("ALTER TABLE admins ADD COLUMN title TEXT DEFAULT '';")
         except Exception:
-            pass  # Колонки уже существуют
+            pass
 
         try:
-            conn.execute(
-                """
-                ALTER TABLE admins ADD COLUMN is_hidden INTEGER DEFAULT 0;
-                """
-            )
+            conn.execute("ALTER TABLE admins ADD COLUMN is_hidden INTEGER DEFAULT 0;")
         except Exception:
-            pass  # Колонки уже существуют
+            pass
 
         # Попытка добавить новые поля в таблицу awards для более красивых наград
         try:
@@ -359,37 +311,6 @@ def init_db(admin_ids: list[int] | None = None) -> None:
             )
         else:
             _ensure_default_faq(conn)
-
-        # Создаём вспомогательные таблицы для игр и лидеров
-        try:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS games (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TEXT NOT NULL,
-                    finished_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS game_players (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    game_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    username TEXT,
-                    role TEXT,
-                    alive INTEGER NOT NULL DEFAULT 1,
-                    last_word TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS wins (
-                    user_id INTEGER PRIMARY KEY,
-                    wins INTEGER NOT NULL DEFAULT 0
-                );
-                """
-            )
-        except Exception:
-            logger.exception("Не удалось создать таблицы для игр")
 
 
 def add_user(user_id: int, username: str | None, first_name: str | None) -> None:
@@ -550,7 +471,7 @@ def add_admin(admin_id: int, rank: str = "Админ", title: str = "", is_hidde
     with _db_lock, _connect() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO admins (id, rank, title, is_hidden) VALUES (?, ?, ?, ?)",
-            (admin_id, rank, title, is_hidden)
+            (admin_id, rank, title, is_hidden),
         )
 
 
@@ -596,7 +517,7 @@ def get_admin_info(admin_id: int) -> dict[str, Any] | None:
     with _db_lock, _connect() as conn:
         row = conn.execute(
             "SELECT id, rank, title, is_hidden FROM admins WHERE id = ?",
-            (admin_id,)
+            (admin_id,),
         ).fetchone()
     return dict(row) if row else None
 
@@ -713,8 +634,19 @@ def add_award(
     created_at = datetime.utcnow().isoformat(timespec="seconds")
     emoji = emoji or ""
     description = description or ""
-    rarity = rarity or "common"
+    rarity = (rarity or "common").lower()
+    unique_rarities = {"epic", "mythic", "ultra", "legendary"}
     with _db_lock, _connect() as conn:
+        # Для особо редких наград запрещаем дублирование по title+rarity
+        if rarity in unique_rarities:
+            exists = conn.execute(
+                "SELECT id FROM awards WHERE title = ? AND rarity = ? LIMIT 1",
+                (title.strip(), rarity),
+            ).fetchone()
+            if exists:
+                # Возвращаем -1 как индикатор, что такая уникальная награда уже существует
+                return -1
+
         cursor = conn.execute(
             "INSERT INTO awards (user_id, chat_id, title, issuer_id, created_at, emoji, description, rarity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, chat_id, title.strip(), issuer_id, created_at, emoji, description, rarity),
@@ -742,221 +674,6 @@ def delete_award(award_id: int) -> bool:
     with _db_lock, _connect() as conn:
         cursor = conn.execute("DELETE FROM awards WHERE id = ?", (award_id,))
     return cursor.rowcount > 0
-
-
-
-
-def add_game_participant(user_id: int, username: str | None, chat_id: int | None) -> bool:
-    """Добавляет пользователя в список участников игры для конкретного чата.
-    Возвращает True, если запись была вставлена, False если уже есть.
-    """
-    joined_at = datetime.utcnow().isoformat(timespec="seconds")
-    with _db_lock, _connect() as conn:
-        try:
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO game_participants (user_id, username, chat_id, joined_at) VALUES (?, ?, ?, ?)",
-                (user_id, username, chat_id or 0, joined_at),
-            )
-            return cursor.rowcount > 0
-        except Exception:
-            logger.exception("Не удалось добавить участника игры в БД")
-            return False
-
-
-
-
-def is_game_participant(user_id: int, chat_id: int | None) -> bool:
-    """Проверяет, участвует ли пользователь в игре для конкретного чата."""
-    with _db_lock, _connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM game_participants WHERE user_id = ? AND chat_id = ?",
-            (user_id, chat_id or 0),
-        ).fetchone()
-    return row is not None
-
-
-def is_game_participant_global(user_id: int) -> bool:
-    """Проверяет, есть ли пользователь в любой игре."""
-    with _db_lock, _connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM game_participants WHERE user_id = ? LIMIT 1",
-            (user_id,),
-        ).fetchone()
-    return row is not None
-
-
-
-
-def list_game_participants(limit: int = 100, chat_id: int | None = None) -> list[dict[str, Any]]:
-    """Возвращает список участников игры.
-
-    Если `chat_id` указан, возвращает участников только для этого чата.
-    """
-    with _db_lock, _connect() as conn:
-        if chat_id is None:
-            rows = conn.execute(
-                "SELECT id, user_id, username, chat_id, joined_at FROM game_participants ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, user_id, username, chat_id, joined_at FROM game_participants WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
-                (chat_id, limit),
-            ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def create_game(chat_id: int) -> int:
-    """Создаёт запись игры и возвращает её ID."""
-    created_at = datetime.utcnow().isoformat(timespec="seconds")
-    with _db_lock, _connect() as conn:
-        cursor = conn.execute(
-            "INSERT INTO games (chat_id, status, created_at) VALUES (?, 'active', ?)",
-            (chat_id, created_at),
-        )
-        return int(cursor.lastrowid)
-
-
-def add_game_player(game_id: int, user_id: int, username: str | None, role: str) -> int:
-    """Добавляет игрока в игру."""
-    with _db_lock, _connect() as conn:
-        cursor = conn.execute(
-            "INSERT INTO game_players (game_id, user_id, username, role, alive) VALUES (?, ?, ?, ?, 1)",
-            (game_id, user_id, username, role),
-        )
-        return int(cursor.lastrowid)
-
-
-def remove_game_player(game_id: int, user_id: int) -> None:
-    """Удаляет игрока из игры (используется если не удалось отправить ЛС)."""
-    with _db_lock, _connect() as conn:
-        conn.execute("DELETE FROM game_players WHERE game_id = ? AND user_id = ?", (game_id, user_id))
-
-
-def get_active_game(chat_id: int) -> dict[str, Any] | None:
-    """Возвращает последнюю активную игру в чате, если есть."""
-    with _db_lock, _connect() as conn:
-        row = conn.execute(
-            "SELECT id, chat_id, status, created_at FROM games WHERE chat_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
-            (chat_id,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def get_game_players(game_id: int) -> list[dict[str, Any]]:
-    """Возвращает всех игроков указанной игры."""
-    with _db_lock, _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, game_id, user_id, username, role, alive, last_word FROM game_players WHERE game_id = ?",
-            (game_id,),
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def clear_game_participants_by_chat(chat_id: int) -> int:
-    """Удаляет всех участников лобби для указанного чата. Возвращает число удалённых записей."""
-    with _db_lock, _connect() as conn:
-        cursor = conn.execute("DELETE FROM game_participants WHERE chat_id = ?", (chat_id,))
-        return cursor.rowcount
-
-
-def clear_game_participants_by_chat(chat_id: int) -> int:
-    """Удаляет всех участников лобби для указанного чата. Возвращает число удалённых записей."""
-    with _db_lock, _connect() as conn:
-        cursor = conn.execute("DELETE FROM game_participants WHERE chat_id = ?", (chat_id,))
-        return cursor.rowcount
-
-
-def get_game_player(game_id: int, user_id: int) -> dict[str, Any] | None:
-    """Возвращает одну запись игрока по game_id и user_id."""
-    with _db_lock, _connect() as conn:
-        row = conn.execute(
-            "SELECT id, game_id, user_id, username, role, alive, last_word FROM game_players WHERE game_id = ? AND user_id = ?",
-            (game_id, user_id),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def set_player_last_word(game_id: int, user_id: int, last_word: str | None) -> None:
-    """Сохраняет последнее слово игрока."""
-    with _db_lock, _connect() as conn:
-        conn.execute(
-            "UPDATE game_players SET last_word = ? WHERE game_id = ? AND user_id = ?",
-            (last_word, game_id, user_id),
-        )
-
-
-def set_player_alive(game_id: int, user_id: int, alive: bool) -> None:
-    """Устанавливает состояние alive для игрока."""
-    with _db_lock, _connect() as conn:
-        conn.execute(
-            "UPDATE game_players SET alive = ? WHERE game_id = ? AND user_id = ?",
-            (1 if alive else 0, game_id, user_id),
-        )
-
-
-def finish_game(game_id: int, winnerside: str) -> None:
-    """Завершает игру и добавляет победы в таблицу wins.
-
-    winnerside: 'mafia' или 'village'
-    """
-    finished_at = datetime.utcnow().isoformat(timespec="seconds")
-    with _db_lock, _connect() as conn:
-        conn.execute("UPDATE games SET status = 'finished', finished_at = ? WHERE id = ?", (finished_at, game_id))
-        if winnerside == "mafia":
-            rows = conn.execute("SELECT user_id FROM game_players WHERE game_id = ? AND role = 'mafia'", (game_id,)).fetchall()
-        else:
-            rows = conn.execute("SELECT user_id FROM game_players WHERE game_id = ? AND role != 'mafia'", (game_id,)).fetchall()
-
-        for r in rows:
-            uid = int(r[0])
-            try:
-                conn.execute(
-                    "INSERT INTO wins (user_id, wins) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET wins = wins + 1",
-                    (uid,),
-                )
-            except Exception:
-                # fallback for older SQLite versions: read/update
-                cur = conn.execute("SELECT wins FROM wins WHERE user_id = ?", (uid,)).fetchone()
-                if cur:
-                    conn.execute("UPDATE wins SET wins = ? WHERE user_id = ?", (int(cur[0]) + 1, uid))
-                else:
-                    conn.execute("INSERT INTO wins (user_id, wins) VALUES (?, 1)", (uid,))
-
-
-def get_top_wins(limit: int = 10) -> list[dict[str, Any]]:
-    """Возвращает топ победителей по убыванию wins."""
-    with _db_lock, _connect() as conn:
-        rows = conn.execute("SELECT user_id, wins FROM wins ORDER BY wins DESC LIMIT ?", (limit,)).fetchall()
-    return [dict(row) for row in rows]
-
-
-def get_user_active_game(user_id: int) -> dict[str, Any] | None:
-    """Возвращает активную игру и её chat_id, если пользователь участвует в ней и жив."""
-    with _db_lock, _connect() as conn:
-        row = conn.execute(
-            """
-            SELECT g.id AS game_id, g.chat_id
-            FROM games g
-            JOIN game_players gp ON gp.game_id = g.id
-            WHERE g.status = 'active' AND gp.user_id = ? AND gp.alive = 1
-            ORDER BY g.id DESC LIMIT 1
-            """,
-            (user_id,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def set_game_status(game_id: int, status: str) -> None:
-    """Устанавливает статус игры (active/finished/etc)."""
-    with _db_lock, _connect() as conn:
-        conn.execute("UPDATE games SET status = ? WHERE id = ?", (status, game_id))
-
-
-def get_game_by_id(game_id: int) -> dict[str, Any] | None:
-    with _db_lock, _connect() as conn:
-        row = conn.execute("SELECT id, chat_id, status, created_at, finished_at FROM games WHERE id = ?", (game_id,)).fetchone()
-    return dict(row) if row else None
 
 
 def get_user(user_id: int) -> dict[str, Any] | None:

@@ -32,11 +32,7 @@ async def setup_commands(bot: Bot) -> None:
         BotCommand(command="rules", description="Правила чата"),
         BotCommand(command="staff", description="Админский состав"),
         BotCommand(command="awards", description="Награды"),
-        BotCommand(command="startgame", description="Запустить игру"),
-        BotCommand(command="join", description="Присоединиться к игре"),
-        BotCommand(command="lynch", description="Казнь игрока (последнее слово, админы)"),
-        BotCommand(command="endgame", description="Завершить игру и записать победу"),
-        BotCommand(command="top", description="Топ побед"),
+        # Игровые команды (мафия) временно отключены
         BotCommand(command="ads", description="Реклама"),
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="warn", description="Выдать варн"),
