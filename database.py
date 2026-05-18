@@ -716,14 +716,26 @@ def get_award(award_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def transfer_award(award_id: int, new_user_id: int) -> bool:
-    """Передаёт существующую награду другому пользователю. Возвращает True при успехе."""
+def transfer_award(award_id: int, new_user_id: int, new_chat_id: int | None = None) -> bool:
+    """Передаёт существующую награду другому пользователю и опционально обновляет chat_id.
+
+    Возвращает True при успешном обновлении, False если награда не найдена.
+    """
     with _db_lock, _connect() as conn:
-        row = conn.execute("SELECT id, user_id FROM awards WHERE id = ?", (award_id,)).fetchone()
+        row = conn.execute("SELECT id, user_id, chat_id FROM awards WHERE id = ?", (award_id,)).fetchone()
         if not row:
             return False
         current_owner = int(row["user_id"])
-        if current_owner == int(new_user_id):
+        current_chat = int(row["chat_id"])
+        # Если ничего не меняется — возвращаем True
+        if current_owner == int(new_user_id) and (new_chat_id is None or current_chat == int(new_chat_id)):
             return True
-        conn.execute("UPDATE awards SET user_id = ? WHERE id = ?", (new_user_id, award_id))
+
+        if new_chat_id is None:
+            conn.execute("UPDATE awards SET user_id = ? WHERE id = ?", (new_user_id, award_id))
+        else:
+            conn.execute(
+                "UPDATE awards SET user_id = ?, chat_id = ? WHERE id = ?",
+                (new_user_id, int(new_chat_id), award_id),
+            )
     return True

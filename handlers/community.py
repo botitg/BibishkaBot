@@ -180,32 +180,64 @@ async def cmd_transfer_award(message: Message, command: CommandObject, bot: Bot)
     """
     args = (command.args or "").split()
 
-    # Определяем цель (reply или явный ID)
-    target_id = None
+    # Определяем цель (reply или явный ID/@username)
     if message.reply_to_message and message.reply_to_message.from_user:
         # reply -> target is replied user, award id expected in args
         if not args or not args[0].isdigit():
-            await message.answer("Использование: ответь на сообщение и отправь /transfer_award AWARD_ID или /transfer_award AWARD_ID TARGET_USER_ID")
+            await message.answer("Использование: ответь на сообщение и отправь /transfer_award AWARD_ID или /transfer_award AWARD_ID @username")
             return
         award_id = int(args[0])
         target_id = message.reply_to_message.from_user.id
     else:
-        if len(args) < 2 or not args[0].isdigit() or not args[1].lstrip("-").isdigit():
-            await message.answer("Использование: /transfer_award AWARD_ID TARGET_USER_ID (или ответ + AWARD_ID)")
+        if len(args) < 2 or not args[0].isdigit():
+            await message.answer("Использование: /transfer_award AWARD_ID TARGET (@username или USER_ID)")
             return
         award_id = int(args[0])
-        target_id = int(args[1])
+        target_token = args[1]
+
+        target_id = None
+        # Если передано имя пользователя (@username или username)
+        if target_token.startswith("@") or not target_token.lstrip("-").isdigit():
+            identifier = target_token
+            if not identifier.startswith("@"):
+                identifier = f"@{identifier}"
+            try:
+                chat = await bot.get_chat(identifier)
+                target_id = int(getattr(chat, "id"))
+            except Exception:
+                # Попробуем без @
+                try:
+                    chat = await bot.get_chat(target_token)
+                    target_id = int(getattr(chat, "id"))
+                except Exception:
+                    await message.answer("Не удалось найти пользователя по имени. Используйте @username или ID.")
+                    return
+        else:
+            target_id = int(target_token)
 
     award = db.get_award(award_id)
     if not award:
         await message.answer("Награда не найдена.")
         return
 
-    # Выполняем перенос
-    success = db.transfer_award(award_id, target_id)
+    # Если команда выполнена в чате и награда принадлежала другому чату, обновляем chat_id автоматически
+    new_chat_id = None
+    if message.chat.type != ChatType.PRIVATE:
+        try:
+            award_chat = int(award.get("chat_id", 0))
+        except Exception:
+            award_chat = 0
+        if award_chat != int(message.chat.id):
+            new_chat_id = int(message.chat.id)
+
+    # Выполняем перенос (включая возможное обновление chat_id)
+    success = db.transfer_award(award_id, target_id, new_chat_id)
     if not success:
-        await message.answer("Не удалось передать награду. Проверьте ID и попробуйте снова.")
+        await message.answer("Не удалось передать награду. Проверьте ID/имя и попробуйте снова.")
         return
 
     target_label = await mention_by_id(bot, target_id)
-    await message.answer(f"✅ Награда <code>{award_id}</code> передана пользователю {target_label}.")
+    if new_chat_id is not None:
+        await message.answer(f"✅ Награда <code>{award_id}</code> передана пользователю {target_label}. (чат обновлён)")
+    else:
+        await message.answer(f"✅ Награда <code>{award_id}</code> передана пользователю {target_label}.")
