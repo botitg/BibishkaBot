@@ -252,6 +252,15 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 description TEXT DEFAULT '',
                 rarity TEXT DEFAULT 'common'
             );
+
+            -- Таблица для отслеживания выданных уникальных типов наград
+            CREATE TABLE IF NOT EXISTS unique_award_issued (
+                title TEXT NOT NULL,
+                rarity TEXT NOT NULL,
+                award_id INTEGER NOT NULL,
+                issued_at TEXT NOT NULL,
+                PRIMARY KEY (title, rarity)
+            );
             """
         )
 
@@ -636,22 +645,37 @@ def add_award(
     description = description or ""
     rarity = (rarity or "common").lower()
     unique_rarities = {"epic", "mythic", "ultra", "legendary"}
+
     with _db_lock, _connect() as conn:
-        # Для особо редких наград запрещаем дублирование по title+rarity
+        # Для особо редких наград запрещаем дублирование по title+rarity.
+        # Проверка и запись делаем в одной транзакции, чтобы избежать гонок.
+        title_clean = title.strip()
         if rarity in unique_rarities:
             exists = conn.execute(
-                "SELECT id FROM awards WHERE title = ? AND rarity = ? LIMIT 1",
-                (title.strip(), rarity),
+                "SELECT award_id FROM unique_award_issued WHERE title = ? AND rarity = ? LIMIT 1",
+                (title_clean, rarity),
             ).fetchone()
             if exists:
-                # Возвращаем -1 как индикатор, что такая уникальная награда уже существует
                 return -1
 
         cursor = conn.execute(
             "INSERT INTO awards (user_id, chat_id, title, issuer_id, created_at, emoji, description, rarity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, chat_id, title.strip(), issuer_id, created_at, emoji, description, rarity),
+            (user_id, chat_id, title_clean, issuer_id, created_at, emoji, description, rarity),
         )
         award_id = int(cursor.lastrowid)
+
+        if rarity in unique_rarities:
+            try:
+                conn.execute(
+                    "INSERT INTO unique_award_issued (title, rarity, award_id, issued_at) VALUES (?, ?, ?, ?)",
+                    (title_clean, rarity, award_id, created_at),
+                )
+            except sqlite3.IntegrityError:
+                # Если в момент вставки произошла гонка и запись уже была добавлена,
+                # откатываем только что вставлённую награду и возвращаем индикатор ошибки.
+                conn.execute("DELETE FROM awards WHERE id = ?", (award_id,))
+                return -1
+
     return award_id
 
 
