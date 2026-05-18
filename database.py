@@ -253,6 +253,16 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 rarity TEXT DEFAULT 'common'
             );
 
+            CREATE TABLE IF NOT EXISTS applied_bans (
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                banned_until TEXT,
+                issuer_id INTEGER,
+                reason TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, chat_id)
+            );
+
             -- Таблица для отслеживания выданных уникальных типов наград
             CREATE TABLE IF NOT EXISTS unique_award_issued (
                 title TEXT NOT NULL,
@@ -739,3 +749,48 @@ def transfer_award(award_id: int, new_user_id: int, new_chat_id: int | None = No
                 (new_user_id, int(new_chat_id), award_id),
             )
     return True
+
+
+def add_ban_record(user_id: int, chat_id: int, banned_until: str | None, issuer_id: int | None = None, reason: str | None = None) -> None:
+    """Сохраняет информацию о бане в БД. `banned_until` — ISO строка или None для перманентного бана."""
+    created_at = datetime.utcnow().isoformat(timespec="seconds")
+    banned_until_val = banned_until if banned_until else None
+    reason_val = reason or ""
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO applied_bans (user_id, chat_id, banned_until, issuer_id, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, chat_id, banned_until_val, issuer_id, reason_val, created_at),
+        )
+
+
+def remove_ban_record(user_id: int, chat_id: int) -> bool:
+    """Удаляет запись о бане; возвращает True если запись удалена."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute("DELETE FROM applied_bans WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+    return cursor.rowcount > 0
+
+
+def get_active_ban(user_id: int, chat_id: int) -> dict[str, Any] | None:
+    """Возвращает запись бана, если она ещё активна; иначе удаляет просроченную запись и возвращает None."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT user_id, chat_id, banned_until, issuer_id, reason, created_at FROM applied_bans WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        ).fetchone()
+        if not row:
+            return None
+        banned_until = row["banned_until"]
+        if not banned_until:
+            return dict(row)
+        try:
+            until_dt = datetime.fromisoformat(banned_until)
+        except Exception:
+            # если не удалось распарсить — считаем запись недействительной и удаляем
+            conn.execute("DELETE FROM applied_bans WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+            return None
+
+        if datetime.utcnow() < until_dt:
+            return dict(row)
+        # просрочен — удаляем и возвращаем None
+        conn.execute("DELETE FROM applied_bans WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+    return None

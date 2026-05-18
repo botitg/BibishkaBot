@@ -285,6 +285,14 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot) -> None:
             f"⛔ Пользователь {target_label} забанен на {_format_duration(seconds)}.\n"
             f"Причина: {reason or 'не указана'}"
         )
+        # Сохраняем запись о бане для возможного авто-ре-бана при повторном заходе
+        try:
+            banned_until_iso = None
+            if seconds > 0:
+                banned_until_iso = (datetime.utcnow() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+            db.add_ban_record(target_id, message.chat.id, banned_until_iso, message.from_user.id if message.from_user else None, reason)
+        except Exception:
+            logger.exception("Не удалось сохранить запись о бане в БД")
         # Проверяем, что бан действительно применился
         try:
             member_after = await bot.get_chat_member(message.chat.id, target_id)
@@ -340,6 +348,10 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot) -> None:
     try:
         await bot.unban_chat_member(message.chat.id, target_id, only_if_banned=True)
         await message.answer(f"✅ Пользователь {target_label} разбанен.")
+        try:
+            db.remove_ban_record(target_id, message.chat.id)
+        except Exception:
+            logger.exception("Не удалось удалить запись о бане из БД после разбанa")
     except (TelegramBadRequest, TelegramForbiddenError):
         logger.exception("Не удалось разбанить пользователя")
         await message.answer("Не удалось снять бан. Проверьте права бота.")
@@ -410,3 +422,40 @@ async def auto_moderation(message: Message, bot: Bot) -> None:
         f"Варны: {count}/{max_warnings}."
     )
     await _apply_warn_limit(bot, message, message.from_user.id, count)
+
+
+@router.message(F.new_chat_members)
+async def auto_reban_new_members(message: Message, bot: Bot) -> None:
+    """При входе новых участников проверяет, есть ли для них активный бан в БД, и повторно банит при необходимости."""
+    if message.new_chat_members is None:
+        return
+
+    for member in message.new_chat_members:
+        # Пропускаем ботов
+        if member.is_bot:
+            continue
+
+        try:
+            active = db.get_active_ban(member.id, message.chat.id)
+        except Exception:
+            logger.exception("Ошибка при проверке записи бана в БД")
+            active = None
+
+        if not active:
+            continue
+
+        banned_until = active.get("banned_until")
+        seconds = 0
+        if banned_until:
+            try:
+                until_dt = datetime.fromisoformat(banned_until)
+                seconds = int((until_dt - datetime.utcnow()).total_seconds())
+            except Exception:
+                seconds = 0
+
+        try:
+            await _ban_user(bot, message.chat.id, member.id, seconds)
+            label = await mention_by_id(bot, member.id)
+            await message.reply(f"⛔ Пользователь {label} автоматически забанен (ранее был забанен).")
+        except Exception:
+            logger.exception("Не удалось автоматически забанить пользователя при входе")
