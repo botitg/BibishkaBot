@@ -8,6 +8,7 @@ import re
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import Message
+from aiogram.enums import ChatType
 
 import database as db
 
@@ -71,6 +72,10 @@ def _answer_from_facts(question: str) -> str:
 @router.message(F.text)
 async def bibishka_ai(message: Message) -> None:
     """Отвечает, когда сообщение начинается с обращения «Бибишка»."""
+    # Отвечаем только в личных сообщениях и только если AI включен в настройках.
+    if message.chat.type != ChatType.PRIVATE:
+        raise SkipHandler()
+
     if not db.get_bool_setting("ai_enabled", True):
         raise SkipHandler()
 

@@ -45,6 +45,15 @@ async def auto_answer_faq(message: Message) -> None:
     if message.text is None or message.text.startswith("/"):
         raise SkipHandler()
 
+    # В группах не отвечаем на сообщения, содержащие обращение к Бибишке
+    try:
+        normalized = db.normalize_text(message.text)
+        if message.chat.type != ChatType.PRIVATE and "бибишка" in normalized:
+            raise SkipHandler()
+    except Exception:
+        # В редком случае, если нормализация упала, просто продолжаем
+        pass
+
     if message.from_user:
         db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
 

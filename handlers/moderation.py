@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import ChatPermissions, Message
@@ -256,6 +256,27 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot) -> None:
         await message.answer("Администратора бота нельзя забанить через эту команду.")
         return
 
+    # Проверяем, не является ли цель админом чата
+    try:
+        target_member = await bot.get_chat_member(message.chat.id, target_id)
+        if getattr(target_member, "status", "") in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.CREATOR):
+            await message.answer("Нельзя забанить администратора чата через эту команду.")
+            return
+    except Exception:
+        # если не удалось получить инфо о пользователе — продолжаем и полагаемся на исключения от Telegram
+        logger.exception("Не удалось получить статус пользователя в чате при попытке бана")
+
+    # Проверяем, что бот имеет право банить участников
+    try:
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(message.chat.id, me.id)
+        can_restrict = bool(getattr(bot_member, "can_restrict_members", False)) or getattr(bot_member, "status", "") in (ChatMemberStatus.OWNER, ChatMemberStatus.CREATOR)
+        if not can_restrict:
+            await message.answer("У меня нет прав для бана участников. Дайте боту право «Ban users" и повторите.")
+            return
+    except Exception:
+        logger.exception("Не удалось проверить права бота в чате")
+
     seconds = duration if duration is not None else db.get_int_setting("default_ban_seconds", 0)
     target_label = await mention_by_id(bot, target_id)
     try:
@@ -264,6 +285,17 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot) -> None:
             f"⛔ Пользователь {target_label} забанен на {_format_duration(seconds)}.\n"
             f"Причина: {reason or 'не указана'}"
         )
+        # Проверяем, что бан действительно применился
+        try:
+            member_after = await bot.get_chat_member(message.chat.id, target_id)
+            status_after = getattr(member_after, "status", "")
+            if status_after in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.CREATOR):
+                await message.answer(
+                    "⚠️ Похоже, бан не применился — пользователь всё ещё в чате. "
+                    "Проверьте права бота и права пользователя (админ/создатель)."
+                )
+        except Exception:
+            logger.exception("Не удалось проверить статус пользователя после бана")
     except (TelegramBadRequest, TelegramForbiddenError):
         logger.exception("Не удалось забанить пользователя")
         await message.answer("Не удалось выдать бан. Проверьте права бота.")
