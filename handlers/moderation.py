@@ -272,7 +272,7 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot) -> None:
         bot_member = await bot.get_chat_member(message.chat.id, me.id)
         can_restrict = bool(getattr(bot_member, "can_restrict_members", False)) or getattr(bot_member, "status", "") in (ChatMemberStatus.OWNER, ChatMemberStatus.CREATOR)
         if not can_restrict:
-            await message.answer("У меня нет прав для бана участников. Дайте боту право «Ban users" и повторите.")
+            await message.answer('У меня нет прав для бана участников. Дайте боту право «Ban users» и повторите.')
             return
     except Exception:
         logger.exception("Не удалось проверить права бота в чате")
