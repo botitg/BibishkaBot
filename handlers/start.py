@@ -59,13 +59,23 @@ def _faq_or_setting(query: str, setting_key: str, fallback: str) -> str:
 
 
 async def _format_staff(bot: Bot, chat_id: int | None = None) -> str:
-    """Формирует текст состава админов бота и, если можно, чата."""
-    bot_admins = db.list_admins()
+    """Формирует текст состава админов бота и, если можно, чата.
+
+    Скрытые админы не показываются в публичном меню — только в админ-панели.
+    """
+    bot_admins = db.list_admins(include_hidden=False)
     lines = ["👑 <b>Админский состав</b>\n"]
     if bot_admins:
         lines.append("<b>Админы бота:</b>")
-        for admin_id in bot_admins:
-            lines.append(f"• {await mention_by_id(bot, admin_id)}")
+        for admin in bot_admins:
+            admin_id = admin.get("id")
+            rank = admin.get("rank", "Админ")
+            title = admin.get("title", "")
+            mention = await mention_by_id(bot, admin_id)
+            if title:
+                lines.append(f"• {mention} — <b>{rank}</b> ({escape(title)})")
+            else:
+                lines.append(f"• {mention} — <b>{rank}</b>")
     else:
         lines.append("Админы бота пока не назначены.")
 
@@ -234,7 +244,56 @@ async def cmd_endgame(message: Message, bot: Bot, command: CommandObject | None 
 
 @router.message(Command("top"))
 async def cmd_top(message: Message, bot: Bot) -> None:
-    await message.answer("⚠️ Лидеры игр удалены вместе с игрой.")
+    """Показывает несколько лидеров: по сообщениям и по полученным наградам."""
+    chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
+
+    lines = ["🏆 <b>Лидеры активности</b>\n"]
+
+    # Топ по всем сообщениям
+    try:
+        top_all = db.top_senders(chat_id=None, limit=10)
+    except Exception:
+        top_all = []
+
+    if top_all:
+        lines.append("<b>Топ по сообщениям (всего):</b>")
+        for row in top_all:
+            uid = int(row["user_id"])
+            cnt = int(row.get("cnt", 0))
+            label = await mention_by_id(bot, uid)
+            lines.append(f"• {label} — {cnt} сообщений")
+    else:
+        lines.append("Нет данных по сообщениям.")
+
+    # Топ по сообщениям за последнюю неделю
+    try:
+        top_week = db.top_senders_in_period(days=7, chat_id=None, limit=10)
+    except Exception:
+        top_week = []
+
+    if top_week:
+        lines.append("\n<b>Топ по сообщениям (последние 7 дней):</b>")
+        for row in top_week:
+            uid = int(row["user_id"])
+            cnt = int(row.get("cnt", 0))
+            label = await mention_by_id(bot, uid)
+            lines.append(f"• {label} — {cnt} сообщений")
+
+    # Топ по полученным наградам
+    try:
+        top_awards = db.top_awards_received(chat_id=None, limit=10)
+    except Exception:
+        top_awards = []
+
+    if top_awards:
+        lines.append("\n<b>Топ по полученным наградам:</b>")
+        for row in top_awards:
+            uid = int(row["user_id"])
+            cnt = int(row.get("cnt", 0))
+            label = await mention_by_id(bot, uid)
+            lines.append(f"• {label} — {cnt} наград")
+
+    await message.answer("\n".join(lines))
 
 
 @router.callback_query(F.data == "main:awards")

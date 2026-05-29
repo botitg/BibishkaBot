@@ -11,7 +11,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -251,6 +251,13 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 emoji TEXT DEFAULT '',
                 description TEXT DEFAULT '',
                 rarity TEXT DEFAULT 'common'
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS applied_bans (
@@ -698,6 +705,62 @@ def list_awards(user_id: int, chat_id: int | None = None) -> list[dict[str, Any]
         params.append(chat_id)
     query += " ORDER BY id DESC"
 
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_message(user_id: int, chat_id: int) -> None:
+    """Записывает факт отправки сообщения (для топов активности)."""
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            "INSERT INTO messages (user_id, chat_id, created_at) VALUES (?, ?, ?)",
+            (user_id, chat_id, now),
+        )
+
+
+def top_senders(chat_id: int | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    """Возвращает список пользователей, отправивших больше всего сообщений.
+
+    Если `chat_id` указан — для конкретного чата, иначе — по всем чатам.
+    """
+    params: list[Any] = []
+    query = "SELECT user_id, COUNT(*) AS cnt FROM messages"
+    if chat_id is not None:
+        query += " WHERE chat_id = ?"
+        params.append(chat_id)
+    query += " GROUP BY user_id ORDER BY cnt DESC LIMIT ?"
+    params.append(limit)
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def top_senders_in_period(days: int = 7, chat_id: int | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    """Топ отправителей за последние `days` дней."""
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds")
+    params: list[Any] = [since]
+    query = "SELECT user_id, COUNT(*) AS cnt FROM messages WHERE created_at >= ?"
+    if chat_id is not None:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " GROUP BY user_id ORDER BY cnt DESC LIMIT ?"
+    params.append(limit)
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def top_awards_received(chat_id: int | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    """Топ пользователей по количеству полученных наград."""
+    params: list[Any] = []
+    query = "SELECT user_id, COUNT(*) AS cnt FROM awards"
+    if chat_id is not None:
+        query += " WHERE chat_id = ?"
+        params.append(chat_id)
+    query += " GROUP BY user_id ORDER BY cnt DESC LIMIT ?"
+    params.append(limit)
     with _db_lock, _connect() as conn:
         rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]

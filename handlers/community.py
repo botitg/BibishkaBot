@@ -43,19 +43,24 @@ def _mention(user_id: int) -> str:
 async def cmd_staff(message: Message, bot: Bot) -> None:
     """Показывает состав админов бота и текущего чата."""
     lines = ["👑 <b>Админский состав</b>\n"]
-
-    bot_admins = db.list_admins(include_hidden=False)
+    # Показываем скрытых админов только если запрашивающий — админ бота
+    show_hidden = False
+    if message.from_user and db.is_admin(message.from_user.id):
+        show_hidden = True
+    bot_admins = db.list_admins(include_hidden=show_hidden)
     if bot_admins:
         lines.append("<b>Админы бота:</b>")
         for admin in bot_admins:
-            admin_id = admin["id"]
+            admin_id = admin.get("id")
             rank = admin.get("rank", "Админ")
             title = admin.get("title", "")
+            is_hidden = admin.get("is_hidden", 0)
             mention = await mention_by_id(bot, admin_id)
+            hidden_mark = " 🔒" if is_hidden else ""
             if title:
-                lines.append(f"• {mention} — <b>{rank}</b> ({title})")
+                lines.append(f"• {mention} — <b>{rank}</b> ({title}){hidden_mark}")
             else:
-                lines.append(f"• {mention} — <b>{rank}</b>")
+                lines.append(f"• {mention} — <b>{rank}</b>{hidden_mark}")
     else:
         lines.append("Админы бота пока не назначены.")
 
@@ -125,8 +130,8 @@ async def cmd_awards(message: Message, command: CommandObject, bot: Bot) -> None
         await message.answer("Не удалось определить пользователя.")
         return
 
-    chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
-    awards = db.list_awards(target_id, chat_id)
+    # По-умолчанию показываем все награды пользователя из всех чатов
+    awards = db.list_awards(target_id, None)
     target_label = (
         mention_from_user(message.reply_to_message.from_user)
         if message.reply_to_message and message.reply_to_message.from_user
@@ -147,12 +152,37 @@ async def cmd_awards(message: Message, command: CommandObject, bot: Bot) -> None
         rarity_names = {"common": "Обычная", "rare": "Редкая", "epic": "Эпическая", "mythic": "Мифическая", "ultra": "Ультра", "legendary": "Легендарная"}
         rarity_label = rarity_names.get(rarity, "Обычная")
         title = escape(str(award["title"]))
+        # Показываем, в каком чате была выдана награда (если доступно)
+        chat_note = ""
+        try:
+            award_chat = int(award.get("chat_id", 0))
+            if award_chat:
+                chat_note = f" (чат {award_chat})"
+        except Exception:
+            chat_note = ""
         points = points_map.get(rarity, 1)
-        lines.append(f"\n<b>#{award['id']}</b> {emoji} <b>{title}</b> — <i>{rarity_label}</i> — <b>{points} очков</b>")
+        lines.append(f"\n<b>#{award['id']}</b> {emoji} <b>{title}</b>{chat_note} — <i>{rarity_label}</i> — <b>{points} очков</b")
         if desc:
             lines.append(f"{escape(desc)}")
         lines.append(f"Выдал: {issuer_label}")
     await message.answer("\n".join(lines))
+
+
+
+@router.message()
+async def _record_message_for_stats(message: Message) -> None:
+    """Записываем факт каждого пользовательского сообщения для статистики активности."""
+    if message.from_user is None:
+        return
+    # Не учитываем ботов
+    if getattr(message.from_user, "is_bot", False):
+        return
+
+    try:
+        db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        db.record_message(message.from_user.id, message.chat.id)
+    except Exception:
+        logger.exception("Не удалось записать сообщение для статистики")
 
 
 @router.message(Command("unaward"), AdminFilter())
