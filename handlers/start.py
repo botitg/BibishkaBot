@@ -58,12 +58,17 @@ def _faq_or_setting(query: str, setting_key: str, fallback: str) -> str:
     return db.get_setting(setting_key, fallback)
 
 
-async def _format_staff(bot: Bot, chat_id: int | None = None) -> str:
+async def _format_staff(bot: Bot, chat_id: int | None = None, viewer_id: int | None = None) -> str:
     """Формирует текст состава админов бота и, если можно, чата.
 
     Скрытые админы не показываются в публичном меню — только в админ-панели.
     """
-    bot_admins = db.list_admins(include_hidden=False)
+    # Показываем скрытых админов только если вызывающий пользователь — админ бота
+    show_hidden = False
+    if viewer_id is not None and db.is_admin(viewer_id):
+        show_hidden = True
+
+    bot_admins = db.list_admins(include_hidden=show_hidden)
     lines = ["👑 <b>Админский состав</b>\n"]
     if bot_admins:
         lines.append("<b>Админы бота:</b>")
@@ -71,22 +76,35 @@ async def _format_staff(bot: Bot, chat_id: int | None = None) -> str:
             admin_id = admin.get("id")
             rank = admin.get("rank", "Админ")
             title = admin.get("title", "")
+            is_hidden = admin.get("is_hidden", 0)
             mention = await mention_by_id(bot, admin_id)
+            hidden_mark = " 🔒" if is_hidden else ""
             if title:
-                lines.append(f"• {mention} — <b>{rank}</b> ({escape(title)})")
+                lines.append(f"• {mention} — <b>{rank}</b> ({escape(title)}){hidden_mark}")
             else:
-                lines.append(f"• {mention} — <b>{rank}</b>")
+                lines.append(f"• {mention} — <b>{rank}</b>{hidden_mark}")
     else:
         lines.append("Админы бота пока не назначены.")
 
     if chat_id is not None:
         try:
             chat_admins = await bot.get_chat_administrators(chat_id)
+            # Получаем список скрытых админов из БД, чтобы при необходимости скрыть их в списке чата
+            hidden_db_admins = {a["id"] for a in db.list_admins(include_hidden=True) if a.get("is_hidden")}
             lines.append("\n<b>Админы чата:</b>")
-            for admin in chat_admins[:20]:
+            count = 0
+            for admin in chat_admins:
+                if count >= 20:
+                    break
                 user = admin.user
+                # Если админ скрыт в БД и вызывающий не админ — пропускаем
+                if user and user.id in hidden_db_admins and not show_hidden:
+                    continue
                 name = escape(user.full_name)
-                lines.append(f"• <a href=\"tg://user?id={user.id}\">{name}</a>")
+                # Пометка для скрытых админов, если вызывающий — админ
+                hidden_mark = " 🔒" if user and user.id in hidden_db_admins else ""
+                lines.append(f"• <a href=\"tg://user?id={user.id}\">{name}</a>{hidden_mark}")
+                count += 1
         except Exception:
             logger.exception("Не удалось получить админов чата")
 
@@ -205,7 +223,8 @@ async def callback_main_staff(callback: CallbackQuery, bot: Bot) -> None:
         if callback.message and callback.message.chat.type != ChatType.PRIVATE
         else None
     )
-    text = await _format_staff(bot, chat_id)
+    viewer_id = callback.from_user.id if callback.from_user else None
+    text = await _format_staff(bot, chat_id, viewer_id)
     await _safe_edit(callback, text, reply_markup=back_to_main_keyboard())
 
 
@@ -292,6 +311,21 @@ async def cmd_top(message: Message, bot: Bot) -> None:
             cnt = int(row.get("cnt", 0))
             label = await mention_by_id(bot, uid)
             lines.append(f"• {label} — {cnt} наград")
+
+    # Топ по очкам наград (взвешенно по rarity)
+    try:
+        top_award_points = db.top_award_points(chat_id=None, limit=10)
+    except Exception:
+        top_award_points = []
+
+    if top_award_points:
+        lines.append("\n<b>Топ по очкам наград:</b>")
+        for row in top_award_points:
+            uid = int(row["user_id"])
+            points = int(row.get("points", 0))
+            cnt = int(row.get("cnt", 0))
+            label = await mention_by_id(bot, uid)
+            lines.append(f"• {label} — {points} очков ({cnt} наград)")
 
     await message.answer("\n".join(lines))
 

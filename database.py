@@ -766,6 +766,34 @@ def top_awards_received(chat_id: int | None = None, limit: int = 10) -> list[dic
     return [dict(row) for row in rows]
 
 
+def top_award_points(chat_id: int | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    """Топ пользователей по сумме очков наград (взвешено по rarity).
+
+    Баллы соответствуют карте: common=1, rare=5, epic=20, mythic=100, ultra=500, legendary=250.
+    """
+    params: list[Any] = []
+    query = (
+        "SELECT user_id, SUM("
+        "CASE LOWER(rarity) "
+        "WHEN 'common' THEN 1 "
+        "WHEN 'rare' THEN 5 "
+        "WHEN 'epic' THEN 20 "
+        "WHEN 'mythic' THEN 100 "
+        "WHEN 'ultra' THEN 500 "
+        "WHEN 'legendary' THEN 250 "
+        "ELSE 1 END) AS points, COUNT(*) AS cnt "
+        "FROM awards"
+    )
+    if chat_id is not None:
+        query += " WHERE chat_id = ?"
+        params.append(chat_id)
+    query += " GROUP BY user_id ORDER BY points DESC LIMIT ?"
+    params.append(limit)
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
 def delete_award(award_id: int) -> bool:
     """Удаляет награду по ID."""
     with _db_lock, _connect() as conn:

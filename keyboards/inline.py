@@ -23,9 +23,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🌐 Соцсети", callback_data="main:socials")
     builder.button(text="🎥 Стримы", callback_data="main:streams")
     builder.button(text="📣 Реклама", callback_data="main:ads")
-    builder.button(text="👑 Состав", callback_data="main:staff")
     builder.button(text="🏆 Награды", callback_data="main:awards")
-    builder.adjust(2, 2, 2)
+    builder.adjust(2, 2, 1)
     return builder.as_markup()
 
 
