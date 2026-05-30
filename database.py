@@ -269,6 +269,14 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 ended_at TEXT DEFAULT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS marriage_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposer_id INTEGER NOT NULL,
+                proposee_id INTEGER NOT NULL,
+                chat_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS applied_bans (
                 user_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
@@ -921,6 +929,93 @@ def create_marriage(user_a: int, user_b: int, chat_id: int | None = None) -> int
             (user1, user2, chat_id, started_at),
         )
         return int(cursor.lastrowid)
+
+
+def get_active_marriage_between(user_a: int, user_b: int) -> dict[str, Any] | None:
+    """Возвращает активный брак между двумя пользователями, если он есть."""
+    user1, user2 = (int(user_a), int(user_b))
+    if user1 > user2:
+        user1, user2 = user2, user1
+
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, user1_id, user2_id, chat_id, started_at, ended_at
+            FROM marriages
+            WHERE user1_id = ? AND user2_id = ? AND ended_at IS NULL
+            LIMIT 1
+            """,
+            (user1, user2),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_marriage_proposal(proposer_id: int, proposee_id: int, chat_id: int | None = None) -> int:
+    """Создает предложение брака и возвращает его ID.
+
+    Возвращает -1, если пара уже в браке, -2 при попытке предложить самому себе.
+    """
+    proposer_id = int(proposer_id)
+    proposee_id = int(proposee_id)
+    if proposer_id == proposee_id:
+        return -2
+
+    if get_active_marriage_between(proposer_id, proposee_id):
+        return -1
+
+    created_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM marriage_proposals
+            WHERE proposer_id = ? AND proposee_id = ?
+            """,
+            (proposer_id, proposee_id),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO marriage_proposals (proposer_id, proposee_id, chat_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (proposer_id, proposee_id, chat_id, created_at),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_marriage_proposal(proposal_id: int) -> dict[str, Any] | None:
+    """Возвращает предложение брака по ID."""
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, proposer_id, proposee_id, chat_id, created_at
+            FROM marriage_proposals
+            WHERE id = ?
+            """,
+            (proposal_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_marriage_proposal(proposal_id: int) -> bool:
+    """Удаляет предложение брака."""
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute("DELETE FROM marriage_proposals WHERE id = ?", (proposal_id,))
+    return cursor.rowcount > 0
+
+
+def delete_marriage_proposals_between(user_a: int, user_b: int) -> None:
+    """Удаляет все ожидающие предложения между двумя пользователями."""
+    user_a = int(user_a)
+    user_b = int(user_b)
+    with _db_lock, _connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM marriage_proposals
+            WHERE (proposer_id = ? AND proposee_id = ?)
+               OR (proposer_id = ? AND proposee_id = ?)
+            """,
+            (user_a, user_b, user_b, user_a),
+        )
 
 
 def end_marriage_by_id(marriage_id: int) -> bool:

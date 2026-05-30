@@ -32,6 +32,7 @@ async def setup_commands(bot: Bot) -> None:
         BotCommand(command="rules", description="Правила чата"),
         BotCommand(command="staff", description="Админский состав"),
         BotCommand(command="awards", description="Награды"),
+        BotCommand(command="top", description="Топы чата"),
         # Игровые команды (мафия) временно отключены
         BotCommand(command="ads", description="Реклама"),
         BotCommand(command="marry", description="Заключить брак (ответ)"),

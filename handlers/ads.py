@@ -26,11 +26,9 @@ def _sender_card(message: Message) -> str:
     if user is None:
         return "📣 <b>Новая заявка на рекламу</b>\n\nОтправитель неизвестен."
 
-    username = f"@{user.username}" if user.username else "нет username"
     return (
         "📣 <b>Новая заявка на рекламу</b>\n\n"
-        f"👤 Отправитель: {mention_from_user(user)}\n"
-        f"🔗 Username: {escape(username)}"
+        f"👤 Отправитель: {mention_from_user(user)}"
     )
 
 

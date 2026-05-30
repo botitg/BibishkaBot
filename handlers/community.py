@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 from html import escape
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from datetime import datetime
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import database as db
 from utils.filters import AdminFilter
@@ -162,7 +162,7 @@ async def cmd_awards(message: Message, command: CommandObject, bot: Bot) -> None
         except Exception:
             chat_note = ""
         points = points_map.get(rarity, 1)
-        lines.append(f"\n<b>#{award['id']}</b> {emoji} <b>{title}</b>{chat_note} — <i>{rarity_label}</i> — <b>{points} очков</b")
+        lines.append(f"\n<b>#{award['id']}</b> {emoji} <b>{title}</b>{chat_note} — <i>{rarity_label}</i> — <b>{points} очков</b>")
         if desc:
             lines.append(f"{escape(desc)}")
         lines.append(f"Выдал: {issuer_label}")
@@ -186,7 +186,7 @@ def _format_duration(seconds: int) -> str:
 
 @router.message(Command("marry"))
 async def cmd_marry(message: Message, command: CommandObject, bot: Bot) -> None:
-    """Заключает брак между вызывающим и пользователем в reply или по ID."""
+    """Отправляет предложение брака выбранному пользователю."""
     if message.from_user is None:
         return
 
@@ -200,26 +200,99 @@ async def cmd_marry(message: Message, command: CommandObject, bot: Bot) -> None:
         return
 
     chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
-    res = db.create_marriage(message.from_user.id, target_id, chat_id)
-    if res == -1:
+    proposal_id = db.create_marriage_proposal(message.from_user.id, target_id, chat_id)
+    if proposal_id == -1:
         await message.answer("❗ Эти пользователи уже состоят в браке.")
         return
-    if res == -2:
+    if proposal_id == -2:
         await message.answer("❗ Неверные ID пользователей.")
         return
 
-    marriage = db.get_marriage(res)
-    user_a_label = await mention_by_id(bot, int(marriage["user1_id"]))
-    user_b_label = await mention_by_id(bot, int(marriage["user2_id"]))
-    await message.answer(
-        f"💍 <b>Новое брачное соглашение</b>\n{user_a_label} + {user_b_label}\nID: <code>{res}</code>\nДата: <code>{marriage['started_at']}</code>",
-        parse_mode="HTML",
+    proposer_label = mention_from_user(message.from_user)
+    target_label = (
+        mention_from_user(message.reply_to_message.from_user)
+        if message.reply_to_message and message.reply_to_message.from_user
+        else await mention_by_id(bot, target_id)
     )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💍 Принять", callback_data=f"marry:accept:{proposal_id}"),
+                InlineKeyboardButton(text="💔 Отказаться", callback_data=f"marry:decline:{proposal_id}"),
+            ]
+        ]
+    )
+    await message.answer(
+        "💌 <b>Предложение брака</b>\n\n"
+        f"{proposer_label} предлагает брак пользователю {target_label}.\n\n"
+        "Ответить может только тот, кому сделали предложение.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("marry:accept:"))
+async def callback_marry_accept(callback: CallbackQuery, bot: Bot) -> None:
+    """Принимает предложение брака только от адресата."""
+    proposal_id = int(callback.data.rsplit(":", 1)[1])
+    proposal = db.get_marriage_proposal(proposal_id)
+    if not proposal:
+        await callback.answer("Предложение уже неактуально.", show_alert=True)
+        return
+
+    if callback.from_user.id != int(proposal["proposee_id"]):
+        await callback.answer("Это предложение адресовано не тебе.", show_alert=True)
+        return
+
+    chat_id = proposal["chat_id"]
+    marriage_id = db.create_marriage(int(proposal["proposer_id"]), int(proposal["proposee_id"]), chat_id)
+    db.delete_marriage_proposals_between(int(proposal["proposer_id"]), int(proposal["proposee_id"]))
+    if marriage_id == -1:
+        await callback.answer("Эта пара уже в браке.", show_alert=True)
+        return
+
+    marriage = db.get_marriage(marriage_id)
+    proposer_label = await mention_by_id(bot, int(proposal["proposer_id"]))
+    proposee_label = mention_from_user(callback.from_user)
+    text = (
+        "💍 <b>Брак заключен!</b>\n\n"
+        f"{proposer_label} и {proposee_label} теперь пара.\n"
+        f"Номер брака: <code>#{marriage_id}</code>\n"
+        f"Дата: <code>{marriage['started_at']}</code>"
+    )
+    await callback.answer("Поздравляем!")
+    if callback.message:
+        await callback.message.edit_text(text, parse_mode="HTML")
+
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("marry:decline:"))
+async def callback_marry_decline(callback: CallbackQuery, bot: Bot) -> None:
+    """Отклоняет предложение брака только от адресата."""
+    proposal_id = int(callback.data.rsplit(":", 1)[1])
+    proposal = db.get_marriage_proposal(proposal_id)
+    if not proposal:
+        await callback.answer("Предложение уже неактуально.", show_alert=True)
+        return
+
+    if callback.from_user.id != int(proposal["proposee_id"]):
+        await callback.answer("Это предложение адресовано не тебе.", show_alert=True)
+        return
+
+    db.delete_marriage_proposal(proposal_id)
+    proposer_label = await mention_by_id(bot, int(proposal["proposer_id"]))
+    proposee_label = mention_from_user(callback.from_user)
+    await callback.answer("Предложение отклонено.")
+    if callback.message:
+        await callback.message.edit_text(
+            "💔 <b>Предложение отклонено</b>\n\n"
+            f"{proposee_label} отказался/отказалась от предложения {proposer_label}.",
+            parse_mode="HTML",
+        )
 
 
 @router.message(Command("divorce"))
 async def cmd_divorce(message: Message, command: CommandObject, bot: Bot) -> None:
-    """Расторгнуть брак: ответ на сообщение супруга или /divorce MARRIAGE_ID."""
+    """Расторгает конкретный брак только участником пары."""
     if message.from_user is None:
         return
 
@@ -233,42 +306,59 @@ async def cmd_divorce(message: Message, command: CommandObject, bot: Bot) -> Non
             await message.answer("Брак не найден.")
             return
         caller = int(message.from_user.id)
-        if caller not in (int(marriage["user1_id"]), int(marriage["user2_id"])) and not db.is_admin(caller):
-            await message.answer("Только один из супругов или админ может расторгнуть брак.")
+        if marriage.get("ended_at"):
+            await message.answer("Этот брак уже расторгнут.")
+            return
+        if caller not in (int(marriage["user1_id"]), int(marriage["user2_id"])):
+            await message.answer("Расторгнуть этот брак может только один из участников пары.")
             return
         if db.end_marriage_by_id(marriage_id):
-            await message.answer(f"✅ Брак <code>{marriage_id}</code> расторгнут.")
+            u1_label = await mention_by_id(bot, int(marriage["user1_id"]))
+            u2_label = await mention_by_id(bot, int(marriage["user2_id"]))
+            await message.answer(f"✅ Брак <code>#{marriage_id}</code> расторгнут.\n{u1_label} × {u2_label}")
         else:
             await message.answer("Брак уже расторгнут или не найден.")
         return
 
-    # Если ответ на сообщение — расторжение между двумя пользователями
     if message.reply_to_message and message.reply_to_message.from_user:
         spouse_id = message.reply_to_message.from_user.id
         caller_id = message.from_user.id
-        # Если вызывающий — один из супругов, пробуем расторгнуть именно их брак
-        if caller_id != spouse_id and db.end_marriage_between(caller_id, spouse_id):
-            await message.answer("✅ Брак расторгнут.")
+        marriage = db.get_active_marriage_between(caller_id, spouse_id)
+        if caller_id != spouse_id and marriage and db.end_marriage_by_id(int(marriage["id"])):
+            caller_label = mention_from_user(message.from_user)
+            spouse_label = mention_from_user(message.reply_to_message.from_user)
+            await message.answer(f"✅ Брак <code>#{marriage['id']}</code> расторгнут.\n{caller_label} × {spouse_label}")
             return
 
-        # Если вызывающий — админ, он может расторгнуть любые активные браки указанного пользователя в этом чате
-        if db.is_admin(caller_id):
-            chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
-            active = db.list_active_marriages(chat_id)
-            # фильтруем браки, где указан пользователь — супруг
-            to_end = [m for m in active if int(m.get("user1_id")) == int(spouse_id) or int(m.get("user2_id")) == int(spouse_id)]
-            if not to_end:
-                await message.answer("Не найден активный брак для этого пользователя в данном чате.")
-                return
-            for m in to_end:
-                db.end_marriage_by_id(int(m["id"]))
-            await message.answer("✅ Активные браки пользователя расторгнуты администратором.")
-            return
-
-        await message.answer("Не найден активный брак между этими пользователями или у вас нет прав.")
+        await message.answer("Не найден активный брак между вами и этим пользователем.")
         return
 
-    await message.answer("Использование: ответь на сообщение супруга /divorce или /divorce MARRIAGE_ID")
+    active = [
+        marriage
+        for marriage in db.list_marriages_for_user(message.from_user.id, None)
+        if not marriage.get("ended_at")
+    ]
+    if len(active) == 1:
+        marriage = active[0]
+        other_id = int(marriage["user2_id"]) if int(marriage["user1_id"]) == message.from_user.id else int(marriage["user1_id"])
+        other_label = await mention_by_id(bot, other_id)
+        await message.answer(
+            "У тебя один активный брак.\n"
+            f"Пара: {other_label}\n\n"
+            f"Чтобы расторгнуть именно его, напиши: <code>/divorce {marriage['id']}</code>"
+        )
+        return
+
+    if len(active) > 1:
+        lines = ["💔 <b>Твои активные браки</b>\n", "Выбери конкретный номер и напиши <code>/divorce ID</code>:"]
+        for marriage in active[:10]:
+            other_id = int(marriage["user2_id"]) if int(marriage["user1_id"]) == message.from_user.id else int(marriage["user1_id"])
+            other_label = await mention_by_id(bot, other_id)
+            lines.append(f"• <code>#{marriage['id']}</code> — {other_label}")
+        await message.answer("\n".join(lines))
+        return
+
+    await message.answer("У тебя нет активных браков. Использование: reply /divorce или /divorce ID_брака")
 
 
 @router.message(Command("marriages"))
@@ -315,35 +405,41 @@ async def cmd_marriages(message: Message, command: CommandObject, bot: Bot) -> N
         return
 
     # Иначе показываем топы: по длительности браков и по числу браков у пользователей
-    top_marriages = db.top_marriages_by_duration(chat_id=None, limit=10)
-    top_users = db.top_users_by_marriage_count(chat_id=None, limit=10)
+    chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
+    top_marriages = db.top_marriages_by_duration(chat_id=chat_id, limit=10)
+    top_users = db.top_users_by_marriage_count(chat_id=chat_id, limit=10)
 
-    lines = ["💍 <b>Топ браков</b>\n"]
+    lines = [
+        "💍 <b>Браки и пары</b>",
+        "<i>Команды: /marry ответом на сообщение, /divorce ID, /marriages ответом на пользователя</i>\n",
+    ]
     if top_marriages:
-        lines.append("<b>Топ браков по длительности:</b>")
-        for m in top_marriages:
+        lines.append("<b>Самые долгие браки</b>")
+        medals = ["🥇", "🥈", "🥉"]
+        for index, m in enumerate(top_marriages, start=1):
             u1 = int(m["user1_id"])
             u2 = int(m["user2_id"])
             u1_label = await mention_by_id(bot, u1)
             u2_label = await mention_by_id(bot, u2)
             dur = int(m.get("duration", 0))
-            lines.append(f"• {u1_label} + {u2_label} — {_format_duration(dur)} (ID: <code>{m['id']}</code>)")
+            prefix = medals[index - 1] if index <= len(medals) else f"{index}."
+            lines.append(f"{prefix} {u1_label} + {u2_label}\n   <b>{_format_duration(dur)}</b> · <code>#{m['id']}</code>")
     else:
-        lines.append("Нет данных по бракам.")
+        lines.append("<b>Самые долгие браки</b>\nПока нет данных.")
 
     if top_users:
-        lines.append("\n<b>Топ по числу браков:</b>")
-        for row in top_users:
+        lines.append("\n<b>Самые семейные участники</b>")
+        for index, row in enumerate(top_users, start=1):
             uid = int(row["user_id"])
             cnt = int(row.get("cnt", 0))
             label = await mention_by_id(bot, uid)
-            lines.append(f"• {label} — {cnt} браков")
+            lines.append(f"{index}. {label} — <b>{cnt}</b> браков")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 
-@router.message()
+@router.message(~F.text.startswith("/"))
 async def _record_message_for_stats(message: Message) -> None:
     """Записываем факт каждого пользовательского сообщения для статистики активности."""
     if message.from_user is None:
@@ -384,23 +480,23 @@ async def cmd_transfer_award(message: Message, command: CommandObject, bot: Bot)
     """
     args = (command.args or "").split()
 
-    # Определяем цель (reply или явный ID/@username)
+    # Определяем цель (reply или явный ID; старые текстовые идентификаторы тоже поддерживаются).
     if message.reply_to_message and message.reply_to_message.from_user:
         # reply -> target is replied user, award id expected in args
         if not args or not args[0].isdigit():
-            await message.answer("Использование: ответь на сообщение и отправь /transfer_award AWARD_ID или /transfer_award AWARD_ID @username")
+            await message.answer("Использование: ответь на сообщение и отправь /transfer_award AWARD_ID")
             return
         award_id = int(args[0])
         target_id = message.reply_to_message.from_user.id
     else:
         if len(args) < 2 or not args[0].isdigit():
-            await message.answer("Использование: /transfer_award AWARD_ID TARGET (@username или USER_ID)")
+            await message.answer("Использование: /transfer_award AWARD_ID USER_ID")
             return
         award_id = int(args[0])
         target_token = args[1]
 
         target_id = None
-        # Если передано имя пользователя (@username или username)
+        # Если передан текстовый идентификатор, пробуем найти профиль через Telegram.
         if target_token.startswith("@") or not target_token.lstrip("-").isdigit():
             identifier = target_token
             if not identifier.startswith("@"):
@@ -414,7 +510,7 @@ async def cmd_transfer_award(message: Message, command: CommandObject, bot: Bot)
                     chat = await bot.get_chat(target_token)
                     target_id = int(getattr(chat, "id"))
                 except Exception:
-                    await message.answer("Не удалось найти пользователя по имени. Используйте @username или ID.")
+                    await message.answer("Не удалось найти пользователя. Лучше используй reply на сообщение или USER_ID.")
                     return
         else:
             target_id = int(target_token)

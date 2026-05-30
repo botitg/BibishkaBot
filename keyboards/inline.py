@@ -24,7 +24,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🎥 Стримы", callback_data="main:streams")
     builder.button(text="📣 Реклама", callback_data="main:ads")
     builder.button(text="🏆 Награды", callback_data="main:awards")
-    builder.adjust(2, 2, 1)
+    builder.button(text="📊 Топы", callback_data="main:top")
+    builder.button(text="💍 Браки", callback_data="main:marriages")
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup()
 
 

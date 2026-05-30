@@ -46,7 +46,7 @@ def _user_name(message: Message) -> str:
     """Возвращает безопасное имя пользователя для приветствия."""
     if message.from_user is None:
         return "друг"
-    return escape(message.from_user.first_name or message.from_user.username or "друг")
+    return escape(message.from_user.full_name or message.from_user.first_name or "друг")
 
 
 def _faq_or_setting(query: str, setting_key: str, fallback: str) -> str:
@@ -56,6 +56,95 @@ def _faq_or_setting(query: str, setting_key: str, fallback: str) -> str:
         db.record_answer(int(faq["id"]))
         return str(faq["answer"])
     return db.get_setting(setting_key, fallback)
+
+
+def _place(index: int) -> str:
+    """Возвращает красивый маркер места в топе."""
+    medals = ["🥇", "🥈", "🥉"]
+    return medals[index - 1] if index <= len(medals) else f"{index}."
+
+
+def _format_duration(seconds: int) -> str:
+    """Форматирует длительность для топа браков."""
+    minutes = max(0, int(seconds)) // 60
+    hours = minutes // 60
+    days = hours // 24
+    if days:
+        return f"{days}д {hours % 24}ч"
+    if hours:
+        return f"{hours}ч {minutes % 60}м"
+    if minutes:
+        return f"{minutes}м"
+    return f"{seconds}с"
+
+
+async def _build_top_text(bot: Bot, chat_id: int | None) -> str:
+    """Собирает понятное меню топов."""
+    lines = [
+        "📊 <b>Топы чата</b>",
+        "<i>/top — это меню, /marriages — топы браков, /awards — твои награды</i>\n",
+    ]
+
+    top_all = db.top_senders(chat_id=chat_id, limit=5)
+    lines.append("<b>💬 Сообщения за всё время</b>")
+    if top_all:
+        for index, row in enumerate(top_all, start=1):
+            label = await mention_by_id(bot, int(row["user_id"]))
+            lines.append(f"{_place(index)} {label} — <b>{int(row.get('cnt', 0))}</b>")
+    else:
+        lines.append("Пока нет статистики сообщений.")
+
+    top_week = db.top_senders_in_period(days=7, chat_id=chat_id, limit=5)
+    lines.append("\n<b>🔥 Активность за 7 дней</b>")
+    if top_week:
+        for index, row in enumerate(top_week, start=1):
+            label = await mention_by_id(bot, int(row["user_id"]))
+            lines.append(f"{_place(index)} {label} — <b>{int(row.get('cnt', 0))}</b>")
+    else:
+        lines.append("За неделю пока пусто.")
+
+    top_points = db.top_award_points(chat_id=chat_id, limit=5)
+    lines.append("\n<b>🏆 Очки наград</b>")
+    if top_points:
+        for index, row in enumerate(top_points, start=1):
+            label = await mention_by_id(bot, int(row["user_id"]))
+            points = int(row.get("points", 0))
+            count = int(row.get("cnt", 0))
+            lines.append(f"{_place(index)} {label} — <b>{points}</b> очков · {count} наград")
+    else:
+        lines.append("Наград пока нет.")
+
+    return "\n".join(lines)
+
+
+async def _build_marriages_text(bot: Bot, chat_id: int | None) -> str:
+    """Собирает понятное меню браков."""
+    lines = [
+        "💍 <b>Браки</b>",
+        "<i>/marry ответом — сделать предложение, /divorce ID — расторгнуть конкретный брак</i>\n",
+    ]
+
+    top_marriages = db.top_marriages_by_duration(chat_id=chat_id, limit=5)
+    lines.append("<b>Самые долгие пары</b>")
+    if top_marriages:
+        for index, marriage in enumerate(top_marriages, start=1):
+            u1_label = await mention_by_id(bot, int(marriage["user1_id"]))
+            u2_label = await mention_by_id(bot, int(marriage["user2_id"]))
+            duration = _format_duration(int(marriage.get("duration", 0)))
+            lines.append(f"{_place(index)} {u1_label} + {u2_label}\n   <b>{duration}</b> · <code>#{marriage['id']}</code>")
+    else:
+        lines.append("Пока нет браков.")
+
+    top_users = db.top_users_by_marriage_count(chat_id=chat_id, limit=5)
+    lines.append("\n<b>Самые семейные участники</b>")
+    if top_users:
+        for index, row in enumerate(top_users, start=1):
+            label = await mention_by_id(bot, int(row["user_id"]))
+            lines.append(f"{index}. {label} — <b>{int(row.get('cnt', 0))}</b> браков")
+    else:
+        lines.append("Пока нет данных.")
+
+    return "\n".join(lines)
 
 
 async def _format_staff(bot: Bot, chat_id: int | None = None, viewer_id: int | None = None) -> str:
@@ -263,71 +352,25 @@ async def cmd_endgame(message: Message, bot: Bot, command: CommandObject | None 
 
 @router.message(Command("top"))
 async def cmd_top(message: Message, bot: Bot) -> None:
-    """Показывает несколько лидеров: по сообщениям и по полученным наградам."""
+    """Показывает красивое меню топов."""
     chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
+    await message.answer(await _build_top_text(bot, chat_id))
 
-    lines = ["🏆 <b>Лидеры активности</b>\n"]
 
-    # Топ по всем сообщениям
-    try:
-        top_all = db.top_senders(chat_id=None, limit=10)
-    except Exception:
-        top_all = []
+@router.callback_query(F.data == "main:top")
+async def callback_main_top(callback: CallbackQuery, bot: Bot) -> None:
+    """Показывает топы из главного меню."""
+    await callback.answer()
+    chat_id = callback.message.chat.id if callback.message and callback.message.chat.type != ChatType.PRIVATE else None
+    await _safe_edit(callback, await _build_top_text(bot, chat_id), reply_markup=back_to_main_keyboard())
 
-    if top_all:
-        lines.append("<b>Топ по сообщениям (всего):</b>")
-        for row in top_all:
-            uid = int(row["user_id"])
-            cnt = int(row.get("cnt", 0))
-            label = await mention_by_id(bot, uid)
-            lines.append(f"• {label} — {cnt} сообщений")
-    else:
-        lines.append("Нет данных по сообщениям.")
 
-    # Топ по сообщениям за последнюю неделю
-    try:
-        top_week = db.top_senders_in_period(days=7, chat_id=None, limit=10)
-    except Exception:
-        top_week = []
-
-    if top_week:
-        lines.append("\n<b>Топ по сообщениям (последние 7 дней):</b>")
-        for row in top_week:
-            uid = int(row["user_id"])
-            cnt = int(row.get("cnt", 0))
-            label = await mention_by_id(bot, uid)
-            lines.append(f"• {label} — {cnt} сообщений")
-
-    # Топ по полученным наградам
-    try:
-        top_awards = db.top_awards_received(chat_id=None, limit=10)
-    except Exception:
-        top_awards = []
-
-    if top_awards:
-        lines.append("\n<b>Топ по полученным наградам:</b>")
-        for row in top_awards:
-            uid = int(row["user_id"])
-            cnt = int(row.get("cnt", 0))
-            label = await mention_by_id(bot, uid)
-            lines.append(f"• {label} — {cnt} наград")
-
-    # Топ по очкам наград (взвешенно по rarity)
-    try:
-        top_award_points = db.top_award_points(chat_id=None, limit=10)
-    except Exception:
-        top_award_points = []
-
-    if top_award_points:
-        lines.append("\n<b>Топ по очкам наград:</b>")
-        for row in top_award_points:
-            uid = int(row["user_id"])
-            points = int(row.get("points", 0))
-            cnt = int(row.get("cnt", 0))
-            label = await mention_by_id(bot, uid)
-            lines.append(f"• {label} — {points} очков ({cnt} наград)")
-
-    await message.answer("\n".join(lines))
+@router.callback_query(F.data == "main:marriages")
+async def callback_main_marriages(callback: CallbackQuery, bot: Bot) -> None:
+    """Показывает браки из главного меню."""
+    await callback.answer()
+    chat_id = callback.message.chat.id if callback.message and callback.message.chat.type != ChatType.PRIVATE else None
+    await _safe_edit(callback, await _build_marriages_text(bot, chat_id), reply_markup=back_to_main_keyboard())
 
 
 @router.callback_query(F.data == "main:awards")
