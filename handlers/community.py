@@ -7,6 +7,7 @@ from html import escape
 
 from aiogram import Bot, Router
 from aiogram.enums import ChatType
+from datetime import datetime
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
@@ -166,6 +167,179 @@ async def cmd_awards(message: Message, command: CommandObject, bot: Bot) -> None
             lines.append(f"{escape(desc)}")
         lines.append(f"Выдал: {issuer_label}")
     await message.answer("\n".join(lines))
+
+
+def _format_duration(seconds: int) -> str:
+    """Форматирует секунды в удобочитаемый вид (дни/часы/минуты)."""
+    seconds = int(seconds)
+    minutes = seconds // 60
+    hours = minutes // 60
+    days = hours // 24
+    if days > 0:
+        return f"{days}д {hours % 24}ч {minutes % 60}м"
+    if hours > 0:
+        return f"{hours}ч {minutes % 60}м"
+    if minutes > 0:
+        return f"{minutes}м"
+    return f"{seconds}с"
+
+
+@router.message(Command("marry"))
+async def cmd_marry(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Заключает брак между вызывающим и пользователем в reply или по ID."""
+    if message.from_user is None:
+        return
+
+    target_id, _, explicit = _target_from_args(message, command.args)
+    if target_id is None or not explicit:
+        await message.answer("Использование: ответь на сообщение /marry или /marry USER_ID")
+        return
+
+    if int(target_id) == int(message.from_user.id):
+        await message.answer("❗ Нельзя вступить в брак с самим собой.")
+        return
+
+    chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
+    res = db.create_marriage(message.from_user.id, target_id, chat_id)
+    if res == -1:
+        await message.answer("❗ Эти пользователи уже состоят в браке.")
+        return
+    if res == -2:
+        await message.answer("❗ Неверные ID пользователей.")
+        return
+
+    marriage = db.get_marriage(res)
+    user_a_label = await mention_by_id(bot, int(marriage["user1_id"]))
+    user_b_label = await mention_by_id(bot, int(marriage["user2_id"]))
+    await message.answer(
+        f"💍 <b>Новое брачное соглашение</b>\n{user_a_label} + {user_b_label}\nID: <code>{res}</code>\nДата: <code>{marriage['started_at']}</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("divorce"))
+async def cmd_divorce(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Расторгнуть брак: ответ на сообщение супруга или /divorce MARRIAGE_ID."""
+    if message.from_user is None:
+        return
+
+    args = (command.args or "").strip()
+
+    # Если указан ID брака
+    if args.isdigit():
+        marriage_id = int(args)
+        marriage = db.get_marriage(marriage_id)
+        if not marriage:
+            await message.answer("Брак не найден.")
+            return
+        caller = int(message.from_user.id)
+        if caller not in (int(marriage["user1_id"]), int(marriage["user2_id"])) and not db.is_admin(caller):
+            await message.answer("Только один из супругов или админ может расторгнуть брак.")
+            return
+        if db.end_marriage_by_id(marriage_id):
+            await message.answer(f"✅ Брак <code>{marriage_id}</code> расторгнут.")
+        else:
+            await message.answer("Брак уже расторгнут или не найден.")
+        return
+
+    # Если ответ на сообщение — расторжение между двумя пользователями
+    if message.reply_to_message and message.reply_to_message.from_user:
+        spouse_id = message.reply_to_message.from_user.id
+        caller_id = message.from_user.id
+        # Если вызывающий — один из супругов, пробуем расторгнуть именно их брак
+        if caller_id != spouse_id and db.end_marriage_between(caller_id, spouse_id):
+            await message.answer("✅ Брак расторгнут.")
+            return
+
+        # Если вызывающий — админ, он может расторгнуть любые активные браки указанного пользователя в этом чате
+        if db.is_admin(caller_id):
+            chat_id = None if message.chat.type == ChatType.PRIVATE else message.chat.id
+            active = db.list_active_marriages(chat_id)
+            # фильтруем браки, где указан пользователь — супруг
+            to_end = [m for m in active if int(m.get("user1_id")) == int(spouse_id) or int(m.get("user2_id")) == int(spouse_id)]
+            if not to_end:
+                await message.answer("Не найден активный брак для этого пользователя в данном чате.")
+                return
+            for m in to_end:
+                db.end_marriage_by_id(int(m["id"]))
+            await message.answer("✅ Активные браки пользователя расторгнуты администратором.")
+            return
+
+        await message.answer("Не найден активный брак между этими пользователями или у вас нет прав.")
+        return
+
+    await message.answer("Использование: ответь на сообщение супруга /divorce или /divorce MARRIAGE_ID")
+
+
+@router.message(Command("marriages"))
+async def cmd_marriages(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Показывает топ браков и/или список браков пользователя.
+
+    Использование:
+    - /marriages — топ браков
+    - ответ: /marriages — браки для выбранного пользователя
+    - /marriages USER_ID — браки пользователя
+    """
+    target_id, _, explicit = _target_from_args(message, command.args)
+    # Если указан пользователь — показываем его браки
+    if explicit and target_id is not None:
+        marriages = db.list_marriages_for_user(target_id, None)
+        target_label = (
+            mention_from_user(message.reply_to_message.from_user)
+            if message.reply_to_message and message.reply_to_message.from_user
+            else await mention_by_id(bot, target_id)
+        )
+        if not marriages:
+            await message.answer(f"У пользователя {target_label} нет записей о браках.")
+            return
+        lines = [f"💍 <b>Браки пользователя {target_label}</b>"]
+        for m in marriages[:30]:
+            partner = int(m["user2_id"]) if int(m["user1_id"]) == int(target_id) else int(m["user1_id"]) 
+            partner_label = await mention_by_id(bot, partner)
+            started = m.get("started_at")
+            ended = m.get("ended_at")
+            if ended:
+                # длительность
+                try:
+                    dur = int((datetime.fromisoformat(ended) - datetime.fromisoformat(started)).total_seconds())
+                except Exception:
+                    dur = 0
+                lines.append(f"\n<b>#{m['id']}</b> {partner_label} — {started} — окончено {ended} ({_format_duration(dur)})")
+            else:
+                try:
+                    dur = int((datetime.utcnow() - datetime.fromisoformat(started)).total_seconds())
+                except Exception:
+                    dur = 0
+                lines.append(f"\n<b>#{m['id']}</b> {partner_label} — {started} — активно ({_format_duration(dur)})")
+        await message.answer("\n".join(lines), parse_mode="HTML")
+        return
+
+    # Иначе показываем топы: по длительности браков и по числу браков у пользователей
+    top_marriages = db.top_marriages_by_duration(chat_id=None, limit=10)
+    top_users = db.top_users_by_marriage_count(chat_id=None, limit=10)
+
+    lines = ["💍 <b>Топ браков</b>\n"]
+    if top_marriages:
+        lines.append("<b>Топ браков по длительности:</b>")
+        for m in top_marriages:
+            u1 = int(m["user1_id"])
+            u2 = int(m["user2_id"])
+            u1_label = await mention_by_id(bot, u1)
+            u2_label = await mention_by_id(bot, u2)
+            dur = int(m.get("duration", 0))
+            lines.append(f"• {u1_label} + {u2_label} — {_format_duration(dur)} (ID: <code>{m['id']}</code>)")
+    else:
+        lines.append("Нет данных по бракам.")
+
+    if top_users:
+        lines.append("\n<b>Топ по числу браков:</b>")
+        for row in top_users:
+            uid = int(row["user_id"])
+            cnt = int(row.get("cnt", 0))
+            label = await mention_by_id(bot, uid)
+            lines.append(f"• {label} — {cnt} браков")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 

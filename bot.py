@@ -34,6 +34,9 @@ async def setup_commands(bot: Bot) -> None:
         BotCommand(command="awards", description="Награды"),
         # Игровые команды (мафия) временно отключены
         BotCommand(command="ads", description="Реклама"),
+        BotCommand(command="marry", description="Заключить брак (ответ)"),
+        BotCommand(command="divorce", description="Расторгнуть брак"),
+        BotCommand(command="marriages", description="Список/топ браков"),
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="warn", description="Выдать варн"),
         BotCommand(command="unwarn", description="Снять варн"),

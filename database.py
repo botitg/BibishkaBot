@@ -260,6 +260,15 @@ def init_db(admin_ids: list[int] | None = None) -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS marriages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user1_id INTEGER NOT NULL,
+                user2_id INTEGER NOT NULL,
+                chat_id INTEGER,
+                started_at TEXT NOT NULL,
+                ended_at TEXT DEFAULT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS applied_bans (
                 user_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
@@ -885,3 +894,146 @@ def get_active_ban(user_id: int, chat_id: int) -> dict[str, Any] | None:
         # просрочен — удаляем и возвращаем None
         conn.execute("DELETE FROM applied_bans WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
     return None
+
+
+def create_marriage(user_a: int, user_b: int, chat_id: int | None = None) -> int:
+    """Создаёт запись о браке между двумя пользователями.
+
+    Возвращает ID новой записи или -1, если активный брак между этими людьми уже существует.
+    """
+    if int(user_a) == int(user_b):
+        return -2
+    user1, user2 = (int(user_a), int(user_b))
+    if user1 > user2:
+        user1, user2 = user2, user1
+
+    started_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        exists = conn.execute(
+            "SELECT id FROM marriages WHERE user1_id = ? AND user2_id = ? AND ended_at IS NULL LIMIT 1",
+            (user1, user2),
+        ).fetchone()
+        if exists:
+            return -1
+
+        cursor = conn.execute(
+            "INSERT INTO marriages (user1_id, user2_id, chat_id, started_at) VALUES (?, ?, ?, ?)",
+            (user1, user2, chat_id, started_at),
+        )
+        return int(cursor.lastrowid)
+
+
+def end_marriage_by_id(marriage_id: int) -> bool:
+    """Завершает брак по ID (устанавливает ended_at)."""
+    ended_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE marriages SET ended_at = ? WHERE id = ? AND ended_at IS NULL",
+            (ended_at, marriage_id),
+        )
+    return cursor.rowcount > 0
+
+
+def end_marriage_between(user_a: int, user_b: int) -> bool:
+    """Завершает активный брак между двумя пользователями, если он есть."""
+    user1, user2 = (int(user_a), int(user_b))
+    if user1 > user2:
+        user1, user2 = user2, user1
+    ended_at = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock, _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE marriages SET ended_at = ? WHERE user1_id = ? AND user2_id = ? AND ended_at IS NULL",
+            (ended_at, user1, user2),
+        )
+    return cursor.rowcount > 0
+
+
+def get_marriage(marriage_id: int) -> dict[str, Any] | None:
+    with _db_lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT id, user1_id, user2_id, chat_id, started_at, ended_at FROM marriages WHERE id = ?",
+            (marriage_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_marriages_for_user(user_id: int, chat_id: int | None = None) -> list[dict[str, Any]]:
+    """Возвращает все браки (активные и завершённые) для пользователя."""
+    params: list[Any] = [user_id, user_id]
+    query = "SELECT id, user1_id, user2_id, chat_id, started_at, ended_at FROM marriages WHERE (user1_id = ? OR user2_id = ?)"
+    if chat_id is not None:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " ORDER BY started_at DESC"
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_active_marriages(chat_id: int | None = None) -> list[dict[str, Any]]:
+    """Возвращает активные браки (не завершённые)."""
+    params: list[Any] = []
+    query = "SELECT id, user1_id, user2_id, chat_id, started_at FROM marriages WHERE ended_at IS NULL"
+    if chat_id is not None:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " ORDER BY started_at DESC"
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def top_marriages_by_duration(chat_id: int | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    """Возвращает браки, отсортированные по длительности (секунды) — длиннейшие первыми."""
+    params: list[Any] = []
+    query = "SELECT id, user1_id, user2_id, chat_id, started_at, ended_at FROM marriages"
+    if chat_id is not None:
+        query += " WHERE chat_id = ?"
+        params.append(chat_id)
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    now = datetime.utcnow()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        started = None
+        ended = None
+        try:
+            started = datetime.fromisoformat(row["started_at"])
+        except Exception:
+            continue
+        if row["ended_at"]:
+            try:
+                ended = datetime.fromisoformat(row["ended_at"])
+            except Exception:
+                ended = now
+        else:
+            ended = now
+        duration = (ended - started).total_seconds()
+        item = dict(row)
+        item["duration"] = int(duration)
+        items.append(item)
+
+    items.sort(key=lambda r: r["duration"], reverse=True)
+    return items[:limit]
+
+
+def top_users_by_marriage_count(chat_id: int | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    """Топ пользователей по общему числу браков (включая завершённые)."""
+    with _db_lock, _connect() as conn:
+        if chat_id is None:
+            query = (
+                "SELECT user_id, COUNT(*) AS cnt FROM ("
+                "SELECT user1_id AS user_id FROM marriages UNION ALL SELECT user2_id AS user_id FROM marriages) AS u "
+                "GROUP BY user_id ORDER BY cnt DESC LIMIT ?"
+            )
+            rows = conn.execute(query, (limit,)).fetchall()
+        else:
+            query = (
+                "SELECT user_id, COUNT(*) AS cnt FROM ("
+                "SELECT user1_id AS user_id FROM marriages WHERE chat_id = ? UNION ALL "
+                "SELECT user2_id AS user_id FROM marriages WHERE chat_id = ?) AS u "
+                "GROUP BY user_id ORDER BY cnt DESC LIMIT ?"
+            )
+            rows = conn.execute(query, (chat_id, chat_id, limit)).fetchall()
+    return [dict(row) for row in rows]
