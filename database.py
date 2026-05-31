@@ -1026,7 +1026,8 @@ def end_marriage_by_id(marriage_id: int) -> bool:
             "UPDATE marriages SET ended_at = ? WHERE id = ? AND ended_at IS NULL",
             (ended_at, marriage_id),
         )
-    return cursor.rowcount > 0
+        return cursor.rowcount > 0
+    return False
 
 
 def end_marriage_between(user_a: int, user_b: int) -> bool:
@@ -1040,7 +1041,8 @@ def end_marriage_between(user_a: int, user_b: int) -> bool:
             "UPDATE marriages SET ended_at = ? WHERE user1_id = ? AND user2_id = ? AND ended_at IS NULL",
             (ended_at, user1, user2),
         )
-    return cursor.rowcount > 0
+        return cursor.rowcount > 0
+    return False
 
 
 def get_marriage(marriage_id: int) -> dict[str, Any] | None:
